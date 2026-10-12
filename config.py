@@ -21,8 +21,12 @@ else:
     REPO_ROOT = Path(__file__).resolve().parent
 ROOT_DIR = REPO_ROOT
 
+
+# ------------------------------------------------------------------ 鉴权配置
+AUTH_TOKEN = os.environ.get("GXZB_AUTH_TOKEN", "").strip()
+
 # ------------------------------------------------------------------ 统一版本
-APP_VERSION = "v0.3.9"
+APP_VERSION = "v0.1.0"
 
 # ------------------------------------------------------------------ .env 解析
 def load_env_file(path=None):

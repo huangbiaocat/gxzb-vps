@@ -1044,6 +1044,29 @@ class ManagerHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def is_authenticated(self):
+        token = os.environ.get("GXZB_AUTH_TOKEN", "").strip()
+        if not token:
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            if auth_header[7:].strip() == token:
+                return True
+        if self.headers.get("X-Auth-Token", "").strip() == token:
+            return True
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if query.get("token", [""])[0].strip() == token:
+            return True
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            cookies = [c.strip() for c in cookie_header.split(";")]
+            for c in cookies:
+                if c.startswith("gxzb_token="):
+                    if c.split("=", 1)[1].strip() == token:
+                        return True
+        return False
+
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1063,6 +1086,13 @@ class ManagerHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+
+        # 敏感 API 鉴权拦截 (静态页面 /、/index.html、/favicon.ico、/api/status 保持开放或带掩码，其他配置及写操作严格拦截)
+        token = os.environ.get("GXZB_AUTH_TOKEN", "").strip()
+        if token and path.startswith("/api/") and path not in ["/api/status", "/api/task_state"]:
+            if not self.is_authenticated():
+                self.send_json({"ok": False, "error": "Unauthorized: 请在请求头提供 Authorization: Bearer <token> 或在 URL 参数提供 ?token=<token>"}, status=401)
+                return
 
         if path == "/" or path == "/index.html":
             index_file = STATIC_DIR / "index.html"
@@ -1361,6 +1391,11 @@ h2{{margin-top:0;color:#1e293b;font-size:20px;}}p{{color:#64748b;font-size:14px;
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
+        token = os.environ.get("GXZB_AUTH_TOKEN", "").strip()
+        if token and not self.is_authenticated():
+            self.send_json({"ok": False, "error": "Unauthorized: 敏感写操作需要提供有效鉴权 Token"}, status=401)
+            return
         length = int(self.headers.get("Content-Length", 0))
         post_data = {}
         if length > 0:
