@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""崇左阳光采购平台采集模块。
+
+平台地址: https://cz.gxygcg.com/purchase/list
+列表接口: https://cz.gxygcg.com/bbw_prod/bbw_notice/list
+详情接口: https://cz.gxygcg.com/bbw_prod/bbw_notice/notice_detail
+前端详情: https://cz.gxygcg.com/purchase/detail/?purchase_projects_ids={pid}&notice_type={ntype}&notice_id={nid}
+"""
+
+import sys
+# 控制台编码保护
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import datetime
+import json
+import re
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+import config  # noqa: E402
+
+CZ_BASE_URL = "https://cz.gxygcg.com"
+CZ_LIST_API = f"{CZ_BASE_URL}/bbw_prod/bbw_notice/list"
+CZ_DETAIL_API = f"{CZ_BASE_URL}/bbw_prod/bbw_notice/notice_detail"
+CZ_REGION_CODE = "451400000000"  # 崇左市行政区划代码
+
+# 公告类型映射:
+# 1: 采购/招标公告 -> 招标公告 (001001001002)
+# 2: 变更公告 -> 答疑澄清/变更 (001001001004)
+# 3: 答疑澄清 -> 答疑澄清/变更 (001001001004)
+# 4: 候选人公示 -> 中标候选人公示 (001001001005)
+# 5: 结果公告 -> 中标公告 (001001001006)
+CZ_NOTICE_TYPE_MAP = {
+    1: {"stage": "招标公告", "categorynum": "001001001002"},
+    2: {"stage": "澄清/答疑", "categorynum": "001001001003"},
+    3: {"stage": "澄清/答疑", "categorynum": "001001001003"},
+    4: {"stage": "中标公示", "categorynum": "001001001005"},
+    5: {"stage": "中标公告", "categorynum": "001001001006"},
+}
+
+def get_cz_stage_and_category(ntype: int, title: str = ""):
+    t = title.lower()
+    if any(k in t for k in ["候选人", "候选"]):
+        return "中标公示", "001001001005"
+    if any(k in t for k in ["中标", "成交", "结果"]):
+        return "中标公告", "001001001006"
+    if any(k in t for k in ["控制价", "最高限价", "招标控制价"]):
+        return "控制价公示", "001001001007"
+    if any(k in t for k in ["变更", "澄清", "答疑", "补充", "更正", "修改", "废标", "终止", "流标", "异常"]):
+        return "澄清/答疑", "001001001003"
+    if any(k in t for k in ["计划", "意向"]):
+        return "招标计划", "001001001001"
+    if ntype in CZ_NOTICE_TYPE_MAP:
+        return CZ_NOTICE_TYPE_MAP[ntype]["stage"], CZ_NOTICE_TYPE_MAP[ntype]["categorynum"]
+    return "招标公告", "001001001002"
+
+def _open_url(url, timeout=8):
+    """带重试、放宽 SSL 验证与双通道代理适应的请求。"""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"{CZ_BASE_URL}/purchase/list",
+        "Accept": "application/json, text/plain, */*",
+    }
+    req = urllib.request.Request(url, headers=headers)
+
+    # 优先尝试直连（绕过系统代理），如网络环境受限则回退到系统代理通道
+    openers = [
+        urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx)),
+        urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)),
+    ]
+
+    last_err = None
+    for opener in openers:
+        for attempt in range(2):
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    return resp.read()
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5)
+    if last_err:
+        raise last_err
+
+
+def normalize_cz_record(it, day=None):
+    """将崇左阳光采购的一条工程记录规范化为统一结构。"""
+    infoid = str(it.get("noticeId") or "").strip()
+    title = str(it.get("noticeTitle") or "").strip()
+    if not infoid or not title:
+        return None
+
+    ntype = int(it.get("noticeType") or 1)
+    stage, categorynum = get_cz_stage_and_category(ntype, title)
+
+    # 行业归类：优先按交通、水利、房建市政划分，其余归入其他项目
+    pt_name = str(it.get("purchaseProjectTypeName") or "").strip()
+    if any(k in title for k in ["公路", "道路", "交通", "桥梁", "路桥", "航道", "港口", "高速"]):
+        industry = "交通运输工程"
+    elif any(k in title for k in ["水利", "水库", "堤防", "灌区", "防洪", "灌溉", "水闸", "清淤"]):
+        industry = "水利水运工程"
+    elif pt_name == "工程" or any(k in title for k in ["工程", "施工", "EPC", "总承包", "厂房", "装修改造", "改造", "充电站", "配套项目", "修缮", "配电", "基建", "建筑", "市政", "绿化", "检测", "监理", "勘察", "设计"]):
+        industry = "房建市政工程"
+    else:
+        industry = "其他项目"
+    stage_key = config.STAGE_KEY_MAP.get(stage, "other")
+    badge_class = config.BADGE_CLASS_MAP.get(stage, "badge-gray")
+
+    # 发布时间
+    ntime = it.get("noticeTime")
+    if ntime:
+        try:
+            tz_bj = datetime.timezone(datetime.timedelta(hours=8))
+            pub_time = datetime.datetime.fromtimestamp(ntime / 1000, tz=tz_bj).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pub_time = str(it.get("publishDate") or "")
+    else:
+        pub_time = str(it.get("publishDate") or "")
+
+    owner = str(it.get("tendererName") or it.get("creatorName") or "").strip()
+
+    # 目标链接与详情 API 链接
+    pid = str(it.get("purchaseProjectsIds") or "")
+    link = f"{CZ_BASE_URL}/purchase/detail/?purchase_projects_ids={pid}&notice_type={ntype}&notice_id={infoid}"
+    detail_url = f"{CZ_DETAIL_API}?purchase_projects_ids={pid}&notice_type={ntype}&notice_id={infoid}"
+
+    reasons = []
+    # 1. 重点跟踪项目（无任何金额门槛，命中即触发）
+    proj_hits = [p for p in getattr(config, "FOCUS_PROJECTS", []) if config.fuzzy_match(p, title)]
+    if proj_hits:
+        reasons.extend(["命中重点项目: %s" % p for p in proj_hits])
+
+    # 2. 重点跟踪业主（无任何金额门槛，命中即触发）
+    owner_hits = [o for o in getattr(config, "FOCUS_OWNERS", []) if (config.fuzzy_match(o, title) or (owner and config.fuzzy_match(o, owner)))]
+    if owner_hits:
+        reasons.extend(["命中重点业主: %s" % o for o in owner_hits])
+
+    # 3. 重点类型
+    type_hits = [t for t in getattr(config, "FOCUS_PROJECT_TYPES", []) if t in industry or config.fuzzy_match(t, title)]
+    if type_hits:
+        reasons.extend(["命中重点类型: %s" % t for t in type_hits])
+
+    # 4. 重点预警关键词（若设置了金额门槛则需达到金额门槛）
+    raw_kw_hits = [k for k in getattr(config, "FOCUS_KEYWORDS", []) if k in title]
+    kw_hits = []
+    if raw_kw_hits:
+        min_amount = getattr(config, "FOCUS_MIN_AMOUNT", 0.0) or 0.0
+        if min_amount > 0:
+            amt = config.extract_amount_from_title(title)
+            if amt is not None and amt >= min_amount:
+                try:
+                    from extractors.normalize import format_money
+                except ImportError:
+                    def format_money(v):
+                        return f"{v/10000:.2f}万" if v >= 10000 else f"{v:.2f}元"
+                kw_hits = raw_kw_hits
+                reasons.extend(["命中关键词: %s (金额%s >= 门槛%s)" % (k, format_money(amt), format_money(min_amount)) for k in kw_hits])
+        else:
+            kw_hits = raw_kw_hits
+            reasons.extend(["命中关键词: %s" % k for k in kw_hits])
+
+    is_focus = 1 if (proj_hits or owner_hits or type_hits or kw_hits) else 0
+    focus_tags = []
+    if proj_hits:
+        focus_tags.append("重点项目")
+    if owner_hits:
+        focus_tags.append("重点业主")
+    if kw_hits:
+        focus_tags.append("重点关键词")
+    if type_hits:
+        focus_tags.append("重点类型")
+    if is_focus and not focus_tags:
+        focus_tags.append("重点关注")
+
+    return {
+        "infoid": infoid,
+        "title": title,
+        "categorynum": categorynum,
+        "industry": industry,
+        "stage": stage,
+        "stage_key": stage_key,
+        "badge_class": badge_class,
+        "areacode": "451400",
+        "areaname": "崇左市",
+        "source": "崇左阳光采购",
+        "pub_time": pub_time,
+        "link": link,
+        "detail_url": detail_url,
+        "is_focus": is_focus,
+        "focus_tags": focus_tags,
+        "focus_reason": " | ".join(reasons) if reasons else "",
+        "owner": owner,
+    }
+
+
+def collect_cz_ygcg(day, max_pages=80):
+    """从崇左阳光采购平台采集当日公告。
+    
+    按崇左市区域代码采集全部采购公告（含工程类及工程相关服务、物资项目），
+    不因单一字段缺失而遗漏任何标讯。
+    """
+    params = {
+        "region_code": CZ_REGION_CODE,
+        "page_size": 10,
+    }
+    
+    collected_rows = []
+    raw_records = []
+
+    print(f"-> 正在采集【崇左阳光采购】公告 (日期: {day})...", flush=True)
+    for page in range(1, max_pages + 1):
+        params["page"] = page
+        query_str = urllib.parse.urlencode(params)
+        url = f"{CZ_LIST_API}?{query_str}"
+        try:
+            content = _open_url(url)
+            resp = json.loads(content.decode("utf-8"))
+        except Exception as e:
+            print(f"   [提示] 崇左阳光采购 第 {page} 页请求结束/异常: {e}", flush=True)
+            break
+
+        data_obj = resp.get("data")
+        if isinstance(data_obj, dict):
+            items = data_obj.get("data") or []
+        elif isinstance(data_obj, list):
+            items = data_obj
+        else:
+            items = []
+        if not items:
+            break
+
+        raw_records.extend(items)
+        has_current_or_newer = False
+
+        for it in items:
+            ntime = it.get("noticeTime")
+            if not ntime:
+                continue
+            tz_bj = datetime.timezone(datetime.timedelta(hours=8))
+            item_date = datetime.datetime.fromtimestamp(ntime / 1000, tz=tz_bj).strftime("%Y-%m-%d")
+           
+            if item_date == day:
+                has_current_or_newer = True
+                norm = normalize_cz_record(it, day=day)
+                if norm:
+                    collected_rows.append(norm)
+            elif item_date > day:
+                has_current_or_newer = True
+
+        # 如果本页所有记录的发布日期都已早于 day，则无需再请求下一页（列表按时间倒序）
+        if not has_current_or_newer:
+            break
+
+    print(f"   崇左阳光采购采集完成：获取 {len(raw_records)} 条原始记录，匹配当日 {len(collected_rows)} 条", flush=True)
+    return collected_rows, raw_records
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="采集崇左阳光采购平台公告")
+    parser.add_argument("--date", default=config.today(), help="采集日期 YYYY-MM-DD")
+    args = parser.parse_args()
+    rows, _ = collect_cz_ygcg(args.date)
+    for r in rows:
+        print(f"[{r['stage']}] {r['areaname']} - {r['pub_time']} - {r['title']} - {r['link']}")
+
+    # 独立运行或被编排调用时，将采集结果写入/合并到 data/collect/
+    if rows:
+        collect_file = config.COLLECT_DIR / f"{args.date}.json"
+        existing = []
+        if collect_file.exists():
+            try:
+                existing = json.loads(collect_file.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+        known_ids = {str(r.get("infoid")) for r in existing if r.get("infoid")}
+        added = 0
+        for r in rows:
+            iid = str(r.get("infoid"))
+            if iid not in known_ids:
+                existing.append(r)
+                known_ids.add(iid)
+                added += 1
+        existing.sort(key=lambda x: (x.get("pub_time") or "", x.get("infoid") or ""))
+        collect_file.parent.mkdir(parents=True, exist_ok=True)
+        collect_file.write_text(json.dumps(existing, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"   [写入] 已将 {len(rows)} 条崇左数据合并写入 {collect_file} (新增 {added} 条)", flush=True)
