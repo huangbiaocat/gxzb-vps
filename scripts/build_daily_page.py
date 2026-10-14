@@ -1,0 +1,2179 @@
+# -*- coding: utf-8 -*-
+"""每日明细页生成脚本（视觉设计基准：templates/index-preview.html）。
+
+输入：<DATA_DIR>/daily/YYYY-MM-DD.json      当日入库条目（主键 = 官方 infoid）
+输出：<SITE_DIR>/YYYY-MM-DD.html            当日明细页
+      <LOG_DIR>/YYYY-MM-DD.jsonl            运行日志（以 infoid 为键）
+      <DATA_DIR>/state/index.json           全局 infoid 台账（跨日判重）
+
+唯一识别码：直接使用官方接口返回的 infoid，不自造任何编号，页面也不展示编号；
+            日志 / 台账 / 数据文件统一以 infoid 为键，用于重跑判重与失败条目重查。
+链接口径：不信任数据源 url（历史存在被截断 / 旧路径失效），统一按 infoid + categorynum
+          拼官方详情页地址。
+样式口径：样式在构建时从设计基准内联提取，并对设计基准做 MD5 断言，防止视觉漂移。
+
+用法：
+    python scripts/build_daily_page.py                      # 生成今天（按 .env 时区）
+    python scripts/build_daily_page.py --date 2026-09-10    # 生成指定日期
+    python scripts/build_daily_page.py --refetch            # 列出待重取条目（status != collected）
+退出码：0 成功；1 自检未通过（页面已写盘，需人工检查）。
+"""
+import argparse
+import collections
+import datetime
+import hashlib
+import html as html_mod
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config      # noqa: E402
+import logstore    # noqa: E402
+from overtime_helper import annotate_item_overtime  # noqa: E402
+try:
+    from scripts.delayed_helper import annotate_delayed_item
+    from scripts.scan_record_db import get_scan_record_db
+except ImportError:
+    from delayed_helper import annotate_delayed_item
+    from scan_record_db import get_scan_record_db
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="生成每日明细页")
+    ap.add_argument("--date", default=None, help="目标日期 YYYY-MM-DD，默认今天")
+    ap.add_argument("--all", action="store_true", help="批量重新生成所有已有日期的明细页")
+    ap.add_argument("--refetch", action="store_true", help="只列出日志中待重取的条目")
+    ap.add_argument("--no-vps", action="store_true", help="跳过自动同步上传 VPS")
+    ap.add_argument("--final", action="store_true", help="标记为全天最终版封存页面")
+    ap.add_argument("--scan-time", default="", help="指定本次扫描/封版时间戳 (YYYY-MM-DD HH:MM:SS)")
+    return ap.parse_args(argv)
+
+
+ARGS = parse_args()
+
+if ARGS.all:
+    all_json = sorted(config.DAILY_DIR.glob("*.json"))
+    dates = [p.stem for p in all_json if re.match(r"^\d{4}-\d{2}-\d{2}$", p.stem)]
+    print(f"=== 开始全量重构所有每日页面 (共 {len(dates)} 天) ===")
+    for idx, d in enumerate(dates, 1):
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--date", d, "--no-vps"]
+        if ARGS.final:
+            cmd.append("--final")
+        if ARGS.scan_time:
+            cmd.extend(["--scan-time", ARGS.scan_time])
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[{idx}/{len(dates)}] {d} 生成失败:")
+            print(res.stderr or res.stdout)
+            raise SystemExit(1)
+        print(f"[{idx}/{len(dates)}] {d} OK")
+    if dates:
+        print("正在同步更新首页/归档索引...")
+        import run_daily
+        run_daily.refresh_archive(dates[-1])
+    if not ARGS.no_vps and getattr(config, "AUTO_UPLOAD_VPS", True):
+        print("正在全量同步上传 VPS...")
+        upload_cmd = [sys.executable, str(Path(__file__).resolve().parent / "upload_vps.py")]
+        subprocess.run(upload_cmd, check=True)
+    print("=== 所有每日页面全量重构完成 ===")
+    raise SystemExit(0)
+
+SITE_DIR = config.SITE_DIR          # 页面产物根目录
+OUTDIR = SITE_DIR
+TMPDIR = config.DATA_DIR / "backup"  # 旧产物备份目录（不参与发布）
+DAY = ARGS.date or config.today()
+DAY_KEY = DAY.replace("-", "")
+DATA = config.DAILY_DIR / (DAY + ".json")
+OUT = OUTDIR / (DAY + ".html")
+LOG = logstore.log_path(DAY)
+LOG_DIR = config.LOG_DIR
+PREVIEW = config.TEMPLATE_PREVIEW
+PREVIEW_MD5 = config.PREVIEW_MD5
+DETAIL_TPL = config.DETAIL_URL_TPL
+
+
+def neighbor_url(offset_days):
+    """前 / 后一日的页面地址（缺页时由站点 404 兜底）。"""
+    d = datetime.date.fromisoformat(DAY) + datetime.timedelta(days=offset_days)
+    return "%s/%s.html" % (config.SITE_BASE_URL, d.isoformat())
+
+
+if ARGS.refetch:
+    _pend = logstore.pending_refetch(DAY)
+    print("日期            : %s | 待重取条目数: %d" % (DAY, len(_pend)))
+    for _rec in _pend:
+        print(json.dumps(_rec, ensure_ascii=False))
+    if _pend:
+        _out = config.STATE_DIR / ("refetch-%s.json" % DAY)
+        _out.write_text(json.dumps([r["infoid"] for r in _pend], ensure_ascii=False, indent=2), encoding="utf-8")
+        print("待重取 infoid 清单:", _out)
+    raise SystemExit(0)
+
+config.ensure_dirs()
+
+# ------------------------------------------------------------------ 0. 设计基准校验
+prev_raw = PREVIEW.read_text(encoding="utf-8")
+assert hashlib.md5(prev_raw.encode("utf-8")).hexdigest() == PREVIEW_MD5, \
+    "设计基准 index-preview.html 已变更，请重新核对样式提取"
+
+styles = re.findall(r"<style>(.*?)</style>", prev_raw, flags=re.S)
+assert len(styles) >= 2, "未能从设计基准中提取到样式块"
+PREVIEW_CSS = "\n".join(s.strip() for s in styles)
+
+if not DATA.exists():
+    # 当日暂无入库数据时，自动补空数据文件以支持生成并刷新页面时间
+    DATA.parent.mkdir(parents=True, exist_ok=True)
+    DATA.write_text("[]", encoding="utf-8")
+
+items = json.loads(DATA.read_text(encoding="utf-8"))
+for it in items:
+    it["infoid"] = str(it.get("infoid") or it.get("id") or "")
+    assert it["infoid"], "条目缺少官方唯一识别码 infoid，拒绝生成页面：%r" % it.get("title", "")[:40]
+    link_candidate = it.get("link") or it.get("url") or ""
+    s_raw = it.get("source") or ""
+    if "阳光" in s_raw or it.get("areaname") == "崇左阳光采购" or "cz.gxygcg.com" in link_candidate:
+        it["source"] = "崇左阳光采购"
+        it["areaname"] = "崇左市"
+    else:
+        it["source"] = "广西公共资源交易平台"
+
+    if it.get("source") == "崇左阳光采购" and ("gxygcg.com" in link_candidate):
+        it["link"] = link_candidate
+    elif it.get("source") == "崇左阳光采购":
+        pid = it.get("purchaseProjectsIds") or it.get("purchase_projects_ids") or ""
+        ntype = it.get("noticeType") or it.get("notice_type") or 1
+        it["link"] = f"https://cz.gxygcg.com/purchase/detail/?purchase_projects_ids={pid}&notice_type={ntype}&notice_id={it['infoid']}"
+    else:
+        it["link"] = DETAIL_TPL.format(infoid=it["infoid"], categorynum=it["categorynum"])
+
+    # 规范化行业分类（崇左阳光采购的“房建市政”对齐为“房建市政工程”）
+    if it.get("industry") in ("房建市政", "房建市政工程"):
+        it["industry"] = "房建市政工程"
+
+    # 依据最新配置动态补充重点预警标记
+    title = it.get("title", "")
+    industry = it.get("industry", "")
+    owner = it.get("owner", "")
+    reasons = []
+    focus_tags = []
+    
+    proj_hits = [p for p in getattr(config, "FOCUS_PROJECTS", []) if config.fuzzy_match(p, title)]
+    if proj_hits:
+        for p in proj_hits:
+            msg = "命中重点项目: %s" % p
+            if msg not in reasons:
+                reasons.append(msg)
+        if "重点项目" not in focus_tags:
+            focus_tags.append("重点项目")
+                
+    owner_hits = [o for o in getattr(config, "FOCUS_OWNERS", []) if ((owner and config.fuzzy_match(o, owner)) or config.fuzzy_match(o, title))]
+    if owner_hits:
+        for o in owner_hits:
+            msg = "命中重点业主: %s" % o
+            if msg not in reasons:
+                reasons.append(msg)
+        if "重点业主" not in focus_tags:
+            focus_tags.append("重点业主")
+                
+    type_hits = [t for t in getattr(config, "FOCUS_PROJECT_TYPES", []) if (t in industry or config.fuzzy_match(t, title))]
+    if type_hits:
+        for t in type_hits:
+            msg = "命中重点类型: %s" % t
+            if msg not in reasons:
+                reasons.append(msg)
+        if "重点类型" not in focus_tags:
+            focus_tags.append("重点类型")
+                
+    raw_kw_hits = [k for k in getattr(config, "FOCUS_KEYWORDS", []) if k in title]
+    kw_hits = []
+    if raw_kw_hits:
+        min_amount = getattr(config, "FOCUS_MIN_AMOUNT", 0.0) or 0.0
+        if min_amount > 0:
+            # 优先从标题提取，提取不到可从 notice_fields 查询已提取金额
+            amt = config.extract_amount_from_title(title)
+            if amt is None:
+                infoid = it.get("infoid", "")
+                if infoid and getattr(config, "DB_PATH", None) and config.DB_PATH.exists():
+                    try:
+                        import sqlite3
+                        with sqlite3.connect(str(config.DB_PATH)) as conn:
+                            c = conn.cursor()
+                            c.execute("SELECT value_num FROM notice_fields WHERE infoid = ? AND value_type = 'money' AND value_num IS NOT NULL ORDER BY value_num DESC LIMIT 1", (infoid,))
+                            r = c.fetchone()
+                            if r and r[0] is not None:
+                                amt = float(r[0])
+                    except Exception:
+                        pass
+            if amt is not None and amt >= min_amount:
+                from extractors.normalize import format_money
+                kw_hits = raw_kw_hits
+                for k in kw_hits:
+                    msg = "命中关键词: %s (金额%s >= 门槛%s)" % (k, format_money(amt), format_money(min_amount))
+                    if msg not in reasons:
+                        reasons.append(msg)
+                if "重点关键词" not in focus_tags:
+                    focus_tags.append("重点关键词")
+        else:
+            kw_hits = raw_kw_hits
+            for k in kw_hits:
+                msg = "命中关键词: %s" % k
+                if msg not in reasons:
+                    reasons.append(msg)
+            if "重点关键词" not in focus_tags:
+                focus_tags.append("重点关键词")
+                
+    if proj_hits or owner_hits or type_hits or kw_hits:
+        it["is_focus"] = 1
+        it["focus_reason"] = reasons
+        it["focus_tags"] = focus_tags
+    else:
+        it["is_focus"] = 0
+        it["focus_reason"] = []
+        it["focus_tags"] = []
+
+    annotate_item_overtime(it)
+    # 滞后公开判定：直接以首次扫描记录存证库（ScanRecordDB）为不可篡改的证据准绳
+    rec = get_scan_record_db().get_record(it.get("infoid"))
+    if rec and rec.get("is_delayed"):
+        it["is_delayed"] = 1
+        it["delay_days"] = rec.get("delay_days", 0)
+        it["delay_hours"] = rec.get("delay_hours", 0)
+        it["delay_label"] = rec.get("delay_label") or (
+            f"滞后 {it['delay_days']}天" if it["delay_days"] >= 1 else (
+                f"滞后 {it['delay_hours']}小时" if it["delay_hours"] >= 1 else "滞后公开"
+            )
+        )
+        it["delayed_type"] = "滞后公开"
+        it["first_seen_date"] = rec.get("first_scan_date")
+        it["first_seen_time"] = rec.get("first_scan_time")
+        it["delayed_reason"] = rec.get("evidence_text")
+        it["is_focus"] = 1
+        tags = it.setdefault("focus_tags", [])
+        tags = [t for t in tags if t != "滞后补录"]
+        if "滞后公开" not in tags:
+            tags.append("滞后公开")
+        it["focus_tags"] = tags
+        reasons = it.setdefault("focus_reason", [])
+        ev = rec.get("evidence_text") or f"{it['delay_label']}公开现身"
+        if ev not in reasons:
+            reasons.append(ev)
+    elif rec:
+        it["is_delayed"] = 0
+        it["delay_days"] = 0
+        it["delay_hours"] = 0
+        it.pop("delay_label", None)
+        it.pop("delayed_reason", None)
+        it.pop("first_seen_date", None)
+        it.pop("first_seen_time", None)
+        tags = it.get("focus_tags")
+        if isinstance(tags, list):
+            it["focus_tags"] = [t for t in tags if t not in ("滞后补录", "滞后公开")]
+            if not it["focus_tags"]:
+                it["is_focus"] = 0
+                it["focus_reason"] = []
+    else:
+        annotate_delayed_item(it, DAY)
+
+# 回写清洗更新后的 items 到当日 JSON 文件，彻底消除历史脏数据残留
+if DATA.exists():
+    try:
+        DATA.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as _e:
+        pass
+
+# ------------------------------------------------------------------ 0.5 运行日志与 infoid 台账
+# 官方接口返回的 infoid 即公告唯一识别码，直接作为入库判重 / 失败重查 / 跨日去重的主键。
+# 历史自造编号（GX + 日期 + 序号）已废弃，页面不再展示任何编号。
+# 日志：<LOG_DIR>/YYYY-MM-DD.jsonl（一行一条，主键 infoid，含 status / updated_at）
+#      重跑时同一条公告刷新状态而不重复入库；status != collected 的条目可由
+#      `--refetch` 或 logstore.pending_refetch() 列出后按 infoid 重取。
+# 台账：<DATA_DIR>/state/index.json（infoid -> 首次/最近出现日期），用于跨日判重，
+#      避免同一公告在次日被当成新公告重复入库 / 重复推送。
+log_rows, log_pending = 0, []
+log_index = logstore.load_index()
+
+
+# ------------------------------------------------------------------ 1. 数据统计
+stage_counter = collections.Counter(it["stage"] for it in items)
+total_n = len(items)
+focus_n = sum(1 for it in items if it.get("is_focus"))
+focus_proj_n = sum(1 for it in items if "重点项目" in (it.get("focus_tags") or []))
+focus_owner_n = sum(1 for it in items if "重点业主" in (it.get("focus_tags") or []))
+# 加载今日回扫捕获的滞后清单（若有）
+today_delayed_file = config.get_delayed_today_path(DAY)
+today_delayed_items = []
+if today_delayed_file.is_file():
+    try:
+        today_delayed_items = json.loads(today_delayed_file.read_text(encoding="utf-8"))
+    except Exception:
+        today_delayed_items = []
+for dit in today_delayed_items:
+    annotate_delayed_item(dit, DAY)
+
+delayed_n = len(today_delayed_items) + sum(1 for it in items if it.get("is_delayed"))
+stat_map = {
+    "stat-plan": stage_counter.get("招标计划", 0),
+    "stat-notice": stage_counter.get("招标公告", 0),
+    "stat-clarify": stage_counter.get("澄清/答疑", 0),
+    "stat-control": stage_counter.get("控制价公示", 0),
+    "stat-candidate": stage_counter.get("中标公示", 0),
+    "stat-result": stage_counter.get("中标公告", 0),
+    "stat-focus-project": focus_proj_n,
+    "stat-focus-owner": focus_owner_n,
+}
+city_n = len(set(it.get("areaname", "") for it in items))
+cat_n = len(set(it.get("industry", "") for it in items))
+valid_times = [it.get("pub_time") for it in items if it.get("pub_time")]
+latest_pub = max(valid_times) if valid_times else "暂无"
+
+# ------------------------------------------------------------------ 状态与时间口径：
+# 1. 最新公告时间 (latest_pub)：当天已收录数据中最新的发布时间；若无数据则为“暂无”
+# 2. 最近扫描时间 (scan_time)：
+#    - 命令行 --scan-time 显式指定时优先；
+#    - 若为已终版封存的归档页面且未重新加 --final 跑，则保留封存时写入的 finalized_at；
+#    - 否则（日常定时扫描即使无新数据、或执行 --final 终版封装时），均记录当前时间 config.now_stamp()
+final_state_file = config.STATE_DIR / ("final-%s.json" % DAY)
+is_past_day = (DAY < config.today())
+is_final_page = bool(getattr(ARGS, "final", False) or final_state_file.exists() or is_past_day)
+scan_time = getattr(ARGS, "scan_time", "").strip()
+if not scan_time and is_final_page and not getattr(ARGS, "final", False) and final_state_file.exists():
+    try:
+        fin_info = json.loads(final_state_file.read_text(encoding="utf-8"))
+        scan_time = fin_info.get("finalized_at", "").strip()
+    except Exception:
+        pass
+if not scan_time:
+    scan_time = config.now_stamp()
+
+# ------------------------------------------------------------------ 2. 每日页定制样式（preview 未覆盖的组件）
+DAILY_CSS = """
+        /* ===== 每日明细页定制（建立在 preview 设计系统之上） ===== */
+        /* 业务环节与重点信息统计卡：沿用 preview .stat-box，自适应 7 列栅格 */
+        .stats-grid.cols-8 { grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
+        .stats-grid.cols-7 { grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 12px; }
+        .stats-grid.cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+        .stats-grid.cols-8 .stat-box, .stats-grid.cols-7 .stat-box, .stats-grid.cols-6 .stat-box { padding: 13px 12px; }
+        .stats-grid.cols-8 .stat-box .sb-value, .stats-grid.cols-7 .stat-box .sb-value, .stats-grid.cols-6 .stat-box .sb-value { font-size: 1.4rem; }
+        .stats-grid.cols-8 .stat-box.clickable, .stats-grid.cols-7 .stat-box.clickable, .stats-grid.cols-6 .stat-box.clickable {
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            user-select: none;
+        }
+        .stats-grid.cols-8 .stat-box.clickable:hover, .stats-grid.cols-7 .stat-box.clickable:hover, .stats-grid.cols-6 .stat-box.clickable:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px -4px rgba(15, 23, 42, 0.12);
+        }
+        .stats-grid.cols-8 .stat-box.clickable.active, .stats-grid.cols-7 .stat-box.clickable.active, .stats-grid.cols-6 .stat-box.clickable.active {
+            box-shadow: 0 0 0 2px #0f172a, 0 6px 20px -4px rgba(15, 23, 42, 0.2);
+            transform: translateY(-2px);
+        }
+        .stats-grid .stat-box.stage-focus-project.clickable.active {
+            box-shadow: 0 0 0 2px #0284c7, 0 6px 20px -4px rgba(2, 132, 199, 0.28);
+        }
+        .stats-grid .stat-box.stage-focus-owner.clickable.active {
+            box-shadow: 0 0 0 2px #4f46e5, 0 6px 20px -4px rgba(79, 70, 229, 0.28);
+        }
+        @media (max-width: 1200px) {
+            .stats-grid.cols-8 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+            .stats-grid.cols-7 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+            .stats-grid.cols-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+        @media (max-width: 760px) {
+            .stats-grid.cols-8, .stats-grid.cols-7, .stats-grid.cols-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 520px) {
+            .stats-grid.cols-8, .stats-grid.cols-7, .stats-grid.cols-6 { grid-template-columns: 1fr; }
+        }
+
+        /* 页头胶囊导航组 */
+        .nav-caps { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .nav-caps .btn-back, .nav-caps .btn-latest { padding: 7px 14px; font-size: 0.84rem; }
+        .nav-caps .btn-back svg { opacity: 0.8; }
+
+        /* 检索区：上行搜索 + 3 个筛选下拉，下行重点预警 / 重置 / 匹配统计 */
+        .filter-section.daily { flex-direction: column; align-items: stretch; gap: 14px; }
+        .filter-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .filter-row .search-input-wrap { flex: 1 1 300px; max-width: 420px; }
+        .select-input {
+            padding: 9px 34px 9px 12px;
+            font-size: 0.88rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            background-color: #f8fafc;
+            appearance: none;
+            -webkit-appearance: none;
+            cursor: pointer;
+            outline: none;
+            transition: all 0.2s ease;
+            background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+            background-repeat: no-repeat;
+            background-position: right 11px center;
+        }
+        .select-input:hover { background-color: #f1f5f9; }
+        .select-input:focus { background-color: #ffffff; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.12); }
+        .filter-row.bottom { justify-content: space-between; border-top: 1px solid var(--border-light); padding-top: 12px; }
+        .filter-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .btn-focus, .btn-focus-project, .btn-focus-owner, .btn-overtime, .btn-delayed, .btn-reset {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 14px;
+            border-radius: 9999px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .btn-focus-project {
+            color: #0369a1;
+            background: #f0f9ff;
+            border: 1px solid #bae6fd;
+        }
+        .btn-focus-project:hover { background: #e0f2fe; color: #0284c7; }
+        .btn-focus-project.active {
+            background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+            color: #ffffff;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(2, 132, 199, 0.28);
+        }
+        .btn-focus-owner {
+            color: #4338ca;
+            background: #eef2ff;
+            border: 1px solid #c7d2fe;
+        }
+        .btn-focus-owner:hover { background: #e0e7ff; color: #4f46e5; }
+        .btn-focus-owner.active {
+            background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            color: #ffffff;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.28);
+        }
+        .btn-focus { color: var(--danger-text); background: var(--danger-light); border: 1px solid #fecaca; }
+        .btn-focus:hover { background: #fee2e2; }
+        .btn-focus.active {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            color: #ffffff;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25);
+        }
+        .btn-overtime { color: var(--text-secondary); background: #f8fafc; border: 1px solid #e2e8f0; }
+        .btn-overtime:hover { background: #f1f5f9; color: var(--text-primary); }
+        .btn-overtime.active {
+            background: #475569;
+            color: #ffffff;
+            border-color: transparent;
+            box-shadow: 0 2px 6px rgba(71, 85, 105, 0.2);
+        }
+        .btn-delayed {
+            color: #c2410c;
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+        }
+        .btn-delayed:hover {
+            background: #ffedd5;
+            color: #9a3412;
+        }
+        .btn-delayed.active {
+            background: linear-gradient(135deg, #ea580c 0%, #c2410c 100%);
+            color: #ffffff;
+            border-color: transparent;
+            box-shadow: 0 4px 12px rgba(234, 88, 12, 0.25);
+        }
+        .btn-delayed .delayed-count { font-weight: 800; }
+
+        .delayed-chip {
+            flex-shrink: 0;
+            font-size: 0.7rem;
+            font-weight: 700;
+            line-height: 1.6;
+            padding: 2px 9px;
+            border-radius: 9999px;
+            margin-top: 1px;
+            letter-spacing: 0.02em;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: #fff7ed;
+            color: #c2410c;
+            border: 1px solid #fed7aa;
+            cursor: default;
+            box-shadow: 0 1px 2px rgba(194, 65, 12, 0.08);
+            transition: all 0.15s ease;
+        }
+        .delayed-chip:hover {
+            background: #ffedd5;
+            color: #9a3412;
+            border-color: #fdba74;
+        }
+        .focus-chip-delayed {
+            background: #fff7ed;
+            color: #c2410c;
+            border: 1px solid #fed7aa;
+            border-radius: 9999px !important;
+        }
+
+        .delayed-alert-box {
+            background: linear-gradient(180deg, #fffaf5 0%, #fff7ed 100%);
+            border: 1px solid #fed7aa;
+            border-left: 4px solid #ea580c;
+            border-radius: 8px;
+            padding: 14px 18px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 4px rgba(234, 88, 12, 0.08);
+        }
+        .delayed-alert-header {
+            margin-bottom: 10px;
+        }
+        .delayed-alert-title-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #9a3412;
+        }
+        .delayed-alert-badge {
+            display: inline-flex;
+            align-items: center;
+            background: #ea580c;
+            color: #ffffff;
+            font-size: 0.72rem;
+            font-weight: 800;
+            padding: 2px 8px;
+            border-radius: 4px;
+            letter-spacing: 0.04em;
+        }
+        .delayed-alert-desc {
+            font-size: 0.8rem;
+            color: #c2410c;
+            margin-top: 3px;
+        }
+        .delayed-alert-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .delayed-item-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #ffffff;
+            border: 1px solid #fed7aa;
+            border-radius: 6px;
+            padding: 9px 12px;
+            gap: 12px;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+            text-decoration: none;
+            color: inherit;
+        }
+        .delayed-item-row:hover {
+            border-color: #ea580c;
+            box-shadow: 0 2px 6px rgba(234, 88, 12, 0.12);
+        }
+        .delayed-item-main {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            flex: 1;
+        }
+        .delayed-days-tag {
+            background: #fff1f2;
+            color: #e11d48;
+            border: 1px solid #fecdd3;
+            font-size: 0.72rem;
+            font-weight: 800;
+            padding: 2px 8px;
+            border-radius: 4px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .delayed-item-title {
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: #1e293b;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .delayed-item-meta {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.75rem;
+            color: #64748b;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .btn-toggle-delayed-more {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            width: 100%;
+            padding: 8px 12px;
+            margin-top: 6px;
+            background: #ffffff;
+            border: 1px dashed #fed7aa;
+            border-radius: 6px;
+            color: #ea580c;
+            font-size: 0.8rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .btn-toggle-delayed-more:hover {
+            background: #fff7ed;
+            border-color: #ea580c;
+            color: #c2410c;
+        }
+        .btn-overtime .overtime-count { font-weight: 800; }
+        .btn-reset { color: var(--text-secondary); background: #f1f5f9; border: 1px solid transparent; }
+        .btn-reset:hover { background: #e2e8f0; color: var(--text-primary); }
+        .btn-focus .focus-count { font-weight: 800; }
+
+        /* 重点预警条目角标 */
+        .focus-chip {
+            flex-shrink: 0;
+            font-size: 0.7rem;
+            font-weight: 700;
+            line-height: 1.6;
+            padding: 1px 8px;
+            border-radius: 9999px;
+            background: var(--danger-light);
+            color: var(--danger-text);
+            border: 1px solid #fecaca;
+            margin-top: 1px;
+            letter-spacing: 0.02em;
+            display: inline-flex;
+            align-items: center;
+        }
+        .focus-chip-project {
+            background: #fef2f2;
+            color: #b91c1c;
+            border: 1px solid #fecaca;
+        }
+        .focus-chip-owner {
+            background: #fffbeb;
+            color: #b45309;
+            border: 1px solid #fde68a;
+        }
+        .focus-chip-keyword {
+            background: #f5f3ff;
+            color: #6d28d9;
+            border: 1px solid #ddd6fe;
+        }
+        .focus-chip-type {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+        }
+        .overtime-chip {
+            flex-shrink: 0;
+            font-size: 0.7rem;
+            font-weight: 600;
+            line-height: 1.6;
+            padding: 1px 8px;
+            border-radius: 9999px;
+            margin-top: 1px;
+            letter-spacing: 0.02em;
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            background: #f1f5f9;
+            color: #475569;
+            border: 1px solid #e2e8f0;
+            cursor: default;
+            transition: all 0.15s ease;
+        }
+        .overtime-chip:hover {
+            background: #e2e8f0;
+            border-color: #cbd5e1;
+        }
+
+        @media (max-width: 640px) {
+            .filter-row.bottom { flex-direction: column; align-items: flex-start; }
+            .nav-caps { width: 100%; justify-content: flex-start; }
+        }
+
+        /* ===== 主题11：工程类别标题栏 / 公告类型胶囊标签 / 地市标签（对齐参考图） ===== */
+        /* ① 工程类别块头：白底扁平卡片 + 深蓝圆角矩形图标（白色图案） + 黑色粗体标题 */
+        .cat-block { box-shadow: none; }
+        .cat-block .cat-icon {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+            color: #ffffff;
+            border-radius: 10px;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.10);
+        }
+        .cat-block .cat-icon svg { stroke-width: 2.3; }
+        .cat-block .cat-heading { color: #0f172a; font-weight: 800; }
+
+        /* ② 公告类型标签：胶囊形，浅色底 + 同色系深色文字，数量用浅一档同色 */
+        .type-block { --chip-bg: #f1f5f9; --chip-fg: #334155; --chip-num: #94a3b8; }
+        .type-block[data-type="招标计划"] { --chip-bg: #e0f2fe; --chip-fg: #0284c7; --chip-border: #bae6fd; --chip-num: #0284c7; }
+        .type-block[data-type="招标公告"] { --chip-bg: #dcfce7; --chip-fg: #16a34a; --chip-border: #bbf7d0; --chip-num: #16a34a; }
+        .type-block[data-type="澄清/答疑"] { --chip-bg: #fef3c7; --chip-fg: #d97706; --chip-border: #fde68a; --chip-num: #d97706; }
+        .type-block[data-type="控制价公示"] { --chip-bg: #f3e8ff; --chip-fg: #9333ea; --chip-border: #e9d5ff; --chip-num: #9333ea; }
+        .type-block[data-type="中标公示"] { --chip-bg: #e0e7ff; --chip-fg: #4338ca; --chip-border: #c7d2fe; --chip-num: #4338ca; }
+        .type-block[data-type="中标公告"] { --chip-bg: #fdf4ff; --chip-fg: #c026d3; --chip-border: #f0abfc; --chip-num: #a21caf; }
+
+        /* 统一阶段统计卡色彩 (Unified Stage Colors for Stat Boxes) */
+        .stat-box.stage-plan { background: #e0f2fe !important; border-color: #bae6fd !important; }
+        .stat-box.stage-plan .sb-label { color: #0284c7 !important; }
+        .stat-box.stage-plan .sb-value { color: #0284c7 !important; }
+        .stat-box.stage-notice { background: #dcfce7 !important; border-color: #bbf7d0 !important; }
+        .stat-box.stage-notice .sb-label { color: #16a34a !important; }
+        .stat-box.stage-notice .sb-value { color: #16a34a !important; }
+        .stat-box.stage-clarify { background: #fef3c7 !important; border-color: #fde68a !important; }
+        .stat-box.stage-clarify .sb-label { color: #d97706 !important; }
+        .stat-box.stage-clarify .sb-value { color: #d97706 !important; }
+        .stat-box.stage-control { background: #f3e8ff !important; border-color: #e9d5ff !important; }
+        .stat-box.stage-control .sb-label { color: #9333ea !important; }
+        .stat-box.stage-control .sb-value { color: #9333ea !important; }
+        .stat-box.stage-candidate { background: #e0e7ff !important; border-color: #c7d2fe !important; }
+        .stat-box.stage-candidate .sb-label { color: #4338ca !important; }
+        .stat-box.stage-candidate .sb-value { color: #4338ca !important; }
+        .stat-box.stage-award { background: #fdf4ff !important; border-color: #f0abfc !important; }
+        .stat-box.stage-award .sb-label { color: #c026d3 !important; }
+        .stat-box.stage-award .sb-value { color: #a21caf !important; }
+        .stat-box.stage-focus { background: #fef2f2 !important; border-color: #fecaca !important; }
+        .stat-box.stage-focus .sb-label { color: #dc2626 !important; }
+        .stat-box.stage-focus .sb-value { color: #dc2626 !important; }
+
+        .hero-badge-final {
+            background: #ecfdf5 !important;
+            color: #065f46 !important;
+            border-color: #a7f3d0 !important;
+        }
+        .hero-badge-final svg {
+            color: #059669 !important;
+        }
+        .final-tag-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 9999px;
+            background: #ecfdf5;
+            color: #065f46;
+            border: 1px solid #a7f3d0;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+
+        .cat-block .type-head {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 12px;
+            border-radius: 9999px;
+            background: var(--chip-bg);
+            border: 1px solid var(--chip-border, transparent);
+            margin-bottom: 12px;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .cat-block .type-head:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 3px 8px rgba(0, 0, 0, 0.08);
+            filter: brightness(0.96);
+        }
+        .cat-block .type-head:active {
+            transform: translateY(0);
+        }
+        .cat-block .type-head.active-filter {
+            background: var(--chip-fg) !important;
+            border-color: var(--chip-fg) !important;
+            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9), 0 3px 10px rgba(0, 0, 0, 0.18);
+        }
+        .cat-block .type-head.active-filter .type-name,
+        .cat-block .type-head.active-filter .type-count {
+            color: #ffffff !important;
+            opacity: 1 !important;
+        }
+        .cat-block .type-head .type-bar { display: none; }
+        .cat-block .type-head .type-name {
+            font-size: 0.82rem;
+            font-weight: 700;
+            line-height: 1.35;
+            color: var(--chip-fg);
+        }
+        .cat-block .type-head .type-count {
+            font-size: 0.78rem;
+            font-weight: 600;
+            line-height: 1.35;
+            color: var(--chip-num);
+            background: transparent;
+            border: none;
+            padding: 0;
+        }
+
+        /* ③ 条目内地市标签与信源标签：对齐参考图取色 */
+        .cat-block .notice-item .city-tag {
+            background: #f1f5f9;
+            color: #334155;
+            border: 1px solid #e2e8f0;
+            border-radius: 5px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            line-height: 1.25;
+            padding: 2px 8px;
+            flex-shrink: 0;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.15s ease;
+        }
+        .cat-block .notice-item .city-tag:hover {
+            background: #e2e8f0;
+            border-color: #cbd5e1;
+            color: #0f172a;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+        }
+        .cat-block .notice-item .city-tag:active {
+            transform: translateY(0);
+        }
+        .cat-block .notice-item .city-tag.active-filter {
+            background: #2563eb !important;
+            color: #ffffff !important;
+            border-color: #1d4ed8 !important;
+            box-shadow: 0 0 0 1.5px #ffffff, 0 2px 6px rgba(37, 99, 235, 0.35);
+        }
+
+        .cat-block .notice-item .source-tag {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border: 1px solid #bfdbfe;
+            border-radius: 5px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            line-height: 1.25;
+            padding: 2px 8px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.15s ease;
+        }
+        .cat-block .notice-item .source-tag:hover {
+            filter: brightness(0.94);
+            transform: translateY(-1px);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+        }
+        .cat-block .notice-item .source-tag:active {
+            transform: translateY(0);
+        }
+        .cat-block .notice-item .source-tag.active-filter {
+            background: #d97706 !important;
+            color: #ffffff !important;
+            border-color: #b45309 !important;
+            box-shadow: 0 0 0 1.5px #ffffff, 0 2px 6px rgba(217, 119, 6, 0.35);
+        }
+
+        .cat-header .cat-title-group {
+            cursor: pointer;
+            user-select: none;
+        }
+        .cat-header .cat-chip {
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.15s ease;
+        }
+        .cat-header .cat-chip:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+            filter: brightness(0.95);
+        }
+        .cat-header .cat-chip:active {
+            transform: translateY(0);
+        }
+        .cat-header .cat-chip.active-filter {
+            background: #059669 !important;
+            color: #ffffff !important;
+            border-color: #047857 !important;
+            box-shadow: 0 0 0 1.5px #ffffff, 0 2px 6px rgba(5, 150, 105, 0.35);
+        }
+
+        .focus-chip, .overtime-chip, .delayed-chip {
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.15s ease;
+        }
+        .focus-chip:hover, .overtime-chip:hover, .delayed-chip:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
+            filter: brightness(0.95);
+        }
+        .focus-chip:active, .overtime-chip:active, .delayed-chip:active {
+            transform: translateY(0);
+        }
+        .focus-chip.active-filter, .overtime-chip.active-filter, .delayed-chip.active-filter {
+            outline: 2px solid currentColor;
+            outline-offset: 1.5px;
+            font-weight: 700;
+        }
+
+"""
+
+# ------------------------------------------------------------------ 3. 页面骨架（preview 结构与类名）
+PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>广西招投标公告日报 · __DATE__ · 业务环节明细</title>
+<style>
+__PREVIEW_CSS__
+</style>
+<style>
+__DAILY_CSS__
+</style>
+</head>
+<body>
+<!-- Header -->
+<header class="site-header">
+<div class="header-inner">
+<a class="brand-logo" href="./index.html">
+<div class="brand-icon">
+<svg fill="none" height="22" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="22">
+<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+<polyline points="14 2 14 8 20 8"></polyline>
+<line x1="16" x2="8" y1="13" y2="13"></line>
+<line x1="16" x2="8" y1="17" y2="17"></line>
+<polyline points="10 9 9 9 8 9"></polyline>
+</svg>
+</div>
+<div class="brand-text">
+<h1 style="margin: 0;">广西全区招投标公告日报（__DATE__）</h1>
+<p>全区公共资源交易 · 崇左阳光采购公告每日归档</p>
+</div>
+</a>
+<div class="header-actions nav-caps">
+<a class="btn-back" href="./search.html" style="color: #0284c7; border-color: #bae6fd; background: #f0f9ff; font-weight: 700;">
+<svg fill="none" height="15" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="15"><circle cx="11" cy="11" r="8"></circle><line x1="21" x2="16.65" y1="21" y2="16.65"></line></svg>
+<span>全盘检索</span>
+</a>
+<a class="btn-back" href="__PREV_URL__">
+<svg fill="none" height="15" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="15"><polyline points="15 18 9 12 15 6"></polyline></svg>
+<span>前一日</span>
+</a>
+<a class="btn-back" href="./index.html">
+<svg fill="none" height="15" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="15"><path d="M3 10.5 12 3l9 7.5"></path><path d="M5 9.5V20h14V9.5"></path></svg>
+<span>首页</span>
+</a>
+<a class="btn-back" href="__NEXT_URL__">
+<span>后一日</span>
+<svg fill="none" height="15" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="15"><polyline points="9 18 15 12 9 6"></polyline></svg>
+</a>
+</div>
+</div>
+</header>
+
+<main class="page-container">
+    <!-- Hero Overview -->
+    <section class="hero-banner">
+        <div class="hero-content">
+            <div class="hero-badge">
+                <svg fill="currentColor" height="12" viewBox="0 0 24 24" width="12"><circle cx="12" cy="12" r="10"></circle></svg>
+                <span>DAILY BRIEFING · __DATE__</span>
+            </div>
+            <h2 class="hero-title">广西全区招投标公告日报（__DATE__）</h2>
+            <p class="hero-desc">按 6 大业务环节与工程类别归集当日全区公共资源交易公告，每条公告以官方唯一识别码（infoid）入库，便于溯源与查重，点击标题可跳转至官方公告页面查看原文。支持关键词检索、工程大类 / 地市 / 业务环节筛选与重点预警；无公告更新的类别与类型不在此页展示。</p>
+            <div class="stats-grid cols-8">
+                <div class="stat-box stage-plan clickable" data-stage="招标计划" title="点击筛选 招标计划">
+                    <div class="sb-label">招标计划</div>
+                    <div class="sb-value" id="stat-plan">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-notice clickable" data-stage="招标公告" title="点击筛选 招标公告">
+                    <div class="sb-label">招标公告</div>
+                    <div class="sb-value" id="stat-notice">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-clarify clickable" data-stage="澄清/答疑" title="点击筛选 澄清/答疑">
+                    <div class="sb-label">澄清/答疑</div>
+                    <div class="sb-value" id="stat-clarify">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-control clickable" data-stage="控制价公示" title="点击筛选 控制价公示">
+                    <div class="sb-label">控制价公示</div>
+                    <div class="sb-value" id="stat-control">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-candidate clickable" data-stage="中标公示" title="点击筛选 中标公示">
+                    <div class="sb-label">中标公示</div>
+                    <div class="sb-value" id="stat-candidate">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-award clickable" data-stage="中标公告" title="点击筛选 中标公告">
+                    <div class="sb-label">中标公告</div>
+                    <div class="sb-value" id="stat-result">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-focus-project clickable" data-stage="__focus_project__" title="点击筛选 重点项目">
+                    <div class="sb-label">重点项目</div>
+                    <div class="sb-value" id="stat-focus-project">0<span class="sb-unit">条</span></div>
+                </div>
+                <div class="stat-box stage-focus-owner clickable" data-stage="__focus_owner__" title="点击筛选 重点业主">
+                    <div class="sb-label">重点业主</div>
+                    <div class="sb-value" id="stat-focus-owner">0<span class="sb-unit">条</span></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Filter / Search -->
+    <section class="filter-section daily">
+        <div class="filter-row top">
+           <div class="search-input-wrap">
+               <svg class="search-icon" fill="none" height="16" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="16"><circle cx="11" cy="11" r="8"></circle><line x1="21" x2="16.65" y1="21" y2="16.65"></line></svg>
+                <input class="search-input" id="searchInput" placeholder="搜索项目/公告（输入即可跨所有历史日期检索全部结果）..." type="text"/>
+               <button type="button" onclick="var q=(document.getElementById('searchInput').value||'').trim();window.location.href='./search.html'+(q?'?q='+encodeURIComponent(q):'');" title="在全历史数据库中全盘检索" style="border:none;background:#0284c7;color:#fff;border-radius:4px;padding:4px 8px;font-size:12px;font-weight:700;cursor:pointer;margin-left:6px;white-space:nowrap;">全盘检索</button>
+           </div>
+            <select class="select-input" id="industryFilter">
+                <option value="">全部工程大类</option>
+                <option value="水利工程">水利工程</option>
+                <option value="交通工程">交通工程</option>
+                <option value="铁路工程">铁路工程</option>
+                <option value="房建市政工程">房建市政工程</option>
+                <option value="其他项目">其他项目</option>
+            </select>
+            <select class="select-input" id="sourceFilter">
+                <option value="">全部网站 (来源平台)</option>
+                <option value="广西公共资源交易平台">广西公共资源交易平台</option>
+                <option value="崇左阳光采购">崇左阳光采购</option>
+            </select>
+            <select class="select-input" id="cityFilter">
+                <option value="">全部地市 (全区15个交易中心)</option>
+                <option value="自治区">自治区本级</option>
+                <option value="南宁市">南宁市</option>
+                <option value="柳州市">柳州市</option>
+                <option value="桂林市">桂林市</option>
+                <option value="梧州市">梧州市</option>
+                <option value="北海市">北海市</option>
+                <option value="防城港市">防城港市</option>
+                <option value="钦州市">钦州市</option>
+                <option value="贵港市">贵港市</option>
+                <option value="玉林市">玉林市</option>
+                <option value="百色市">百色市</option>
+                <option value="贺州市">贺州市</option>
+                <option value="河池市">河池市</option>
+                <option value="来宾市">来宾市</option>
+                <option value="崇左市">崇左市</option>
+            </select>
+            <select class="select-input" id="stageFilter">
+                <option value="">全部环节 (6大业务环节)</option>
+                <option value="招标计划">招标计划</option>
+                <option value="招标公告">招标公告</option>
+                <option value="澄清/答疑">澄清/答疑</option>
+                <option value="控制价公示">控制价公示</option>
+                <option value="中标公示">中标公示</option>
+                <option value="中标公告">中标公告</option>
+            </select>
+        </div>
+        <div class="filter-row bottom">
+            <div class="filter-actions">
+                <button class="btn-focus-project" id="btnFocusProjectOnly" type="button" title="点击仅筛选命中重点工程/项目的公告">
+                    🎯 仅看重点项目 (<span class="focus-project-count" id="focusProjectCount">0</span>)
+                </button>
+                <button class="btn-focus-owner" id="btnFocusOwnerOnly" type="button" title="点击仅筛选命中重点业主/招标人的公告">
+                    🏢 仅看重点业主 (<span class="focus-owner-count" id="focusOwnerCount">0</span>)
+                </button>
+                <button class="btn-overtime" id="btnOvertimeOnly" type="button" title="点击仅筛选法定节假日、周末或下班后非工作时间发布的公告">
+                    <svg fill="none" height="13" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="13"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                    仅看加班发布 (<span class="overtime-count" id="overtimeCount">0</span>)
+                </button>
+                <button class="btn-delayed" id="btnDelayedOnly" type="button" title="点击筛选官方标称发布于数天前、但在近期回扫中才首次捕获的滞后公开项目">
+                    <svg fill="none" height="13" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="13"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 3"></path></svg>
+                    仅看滞后公开 (<span class="delayed-count" id="delayedCount">0</span>)
+                </button>
+                <button class="btn-reset" id="btnReset" type="button">
+                    <svg fill="none" height="13" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="13"><path d="M3 12a9 9 0 1 0 3-6.7"></path><polyline points="3 4 3 9 8 9"></polyline></svg>
+                    重置所有筛选
+                </button>
+            </div>
+            <span class="filter-hint" id="filterResultCount">当前筛选匹配 <strong>0</strong> 条标讯</span>
+        </div>
+    </section>
+
+   __DELAYED_ALERT_BOX__
+
+    <!-- 全盘跨日期检索结果容器（输入关键词时自动呈现所有历史日期匹配项） -->
+    <div id="globalSearchResults" style="display:none;margin-bottom:20px;"></div>
+
+   <!-- Empty search state -->
+   <div class="empty-search-state" id="emptySearch">
+        <svg fill="none" height="48" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" width="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" x2="16.65" y1="21" y2="16.65"></line></svg>
+        <h3>未找到匹配的公告</h3>
+        <p>请尝试其它关键词，或重置工程大类 / 地市 / 业务环节筛选条件</p>
+    </div>
+
+    <!-- 三级明细：工程类别 → 公告类型 → 条目 -->
+    <div id="recordsContainer"></div>
+</main>
+
+<footer class="site-footer">
+<p>广西公共资源交易平台体系自动化监控系统 · 工程大类及业务环节多层级结构视图</p>
+<p style="margin-top: 6px;">最新公告时间：__LATEST_PUB__ · 最近扫描时间：__SCAN_TIME__ · 由自动化采集监控系统 __APP_VERSION__ 生成</p>
+</footer>
+
+<script>
+const DELAYED_DATA = __DELAYED_DATA__;
+const RAW_DATA = [
+__RAW_DATA__
+];
+
+const IND_ORDER = ['水利工程', '交通工程', '铁路工程', '房建市政工程', '其他项目'];
+const STAGE_ORDER = ['招标计划', '招标公告', '澄清/答疑', '控制价公示', '中标公示', '中标公告'];
+const EXT_ICON = '<svg class="ext-icon" fill="none" height="12" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="12"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path></svg>';
+const OT_ICON = '<svg fill="none" height="11" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="11" style="flex-shrink:0;"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>';
+const DEL_ICON = '<svg fill="none" height="11" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" viewBox="0 0 24 24" width="11" style="flex-shrink:0;"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 3"></path></svg>';
+const CAT_ICON = {
+    '水利工程': '<svg fill="none" height="20" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.3" viewBox="0 0 24 24" width="20"><path d="M3 7.5c2-1.7 4-1.7 6 0s4 1.7 6 0 4-1.7 6 0"></path><path d="M3 12c2-1.7 4-1.7 6 0s4 1.7 6 0 4-1.7 6 0"></path><path d="M3 16.5c2-1.7 4-1.7 6 0s4 1.7 6 0 4-1.7 6 0"></path></svg>',
+    '交通工程': '<svg fill="none" height="20" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" width="20"><path d="M4.5 20 8 4h8l3.5 16"></path><path d="M12 4v4"></path><path d="M12 12v3"></path><path d="M6.6 10h10.8"></path></svg>',
+    '铁路工程': '<svg fill="none" height="20" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" width="20"><rect height="13" rx="3" width="14" x="5" y="3"></rect><path d="M9 7.5h6"></path><path d="M9 11.5h6"></path><path d="M8 16l-2 5"></path><path d="M16 16l2 5"></path><path d="M9.5 21h5"></path></svg>',
+    '房建市政工程': '<svg fill="none" height="20" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" width="20"><path d="M4 21V6a1 1 0 0 1 1-1h7a1 1 0 0 1 1 1v15"></path><path d="M13 10.5h6a1 1 0 0 1 1 1V21"></path><path d="M3 21h18"></path><path d="M7 9h3M7 13h3M7 17h3M16.5 14h.01M16.5 17.5h.01"></path></svg>',
+    '其他项目': '<svg fill="none" height="20" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24" width="20"><path d="M12 3 3 7.6l9 4.6 9-4.6z"></path><path d="M3 12.4 12 17l9-4.6"></path><path d="M3 16.8 12 21.4l9-4.6"></path></svg>'
+};
+
+function shortArea(name) {
+    if (!name) { return '全区'; }
+    if (name === '崇左阳光采购') { return '崇左阳光采购'; }
+    if (name.indexOf('自治区') === 0) { return '区中心'; }
+    return name.replace(/市$/, '');
+}
+
+function mapToCityFilter(raw) {
+    if (!raw) return '';
+    var s = String(raw).trim();
+    if (s.indexOf('自治区') !== -1) return '自治区';
+    var cities = ['南宁', '柳州', '桂林', '梧州', '北海', '防城港', '钦州', '贵港', '玉林', '百色', '贺州', '河池', '来宾', '崇左'];
+    for (var i = 0; i < cities.length; i++) {
+        if (s.indexOf(cities[i]) !== -1) return cities[i] + '市';
+    }
+    if (/龙州|扶绥|宁明|凭祥|大新|天等/.test(s)) return '崇左市';
+    return s.endsWith('市') ? s : (s + '市');
+}
+
+function showFilterToast(msg) {
+    var toast = document.getElementById('filterToast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'filterToast';
+        toast.style.position = 'fixed';
+        toast.style.bottom = '28px';
+        toast.style.left = '50%';
+        toast.style.transform = 'translateX(-50%) translateY(0)';
+        toast.style.background = 'rgba(15, 23, 42, 0.92)';
+        toast.style.color = '#ffffff';
+        toast.style.padding = '8px 18px';
+        toast.style.borderRadius = '9999px';
+        toast.style.fontSize = '0.85rem';
+        toast.style.fontWeight = '500';
+        toast.style.boxShadow = '0 10px 25px -5px rgba(0, 0, 0, 0.3)';
+        toast.style.zIndex = '99999';
+        toast.style.pointerEvents = 'none';
+        toast.style.backdropFilter = 'blur(6px)';
+        toast.style.webkitBackdropFilter = 'blur(6px)';
+        toast.style.transition = 'opacity 0.22s ease, transform 0.22s ease';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.style.opacity = '1';
+    toast.style.transform = 'translateX(-50%) translateY(0)';
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(function () {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(-50%) translateY(8px)';
+    }, 1600);
+}
+
+function checkScrollAfterFilter() {
+    var firstVisible = container.querySelector('.cat-block:not([hidden])');
+    if (firstVisible) {
+        var rect = firstVisible.getBoundingClientRect();
+        if (rect.top < 60 || rect.top > window.innerHeight - 100) {
+            firstVisible.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    }
+}
+
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+const container = document.getElementById('recordsContainer');
+const empty = document.getElementById('emptySearch');
+const hint = document.getElementById('filterResultCount');
+const searchInput = document.getElementById('searchInput');
+const industryFilter = document.getElementById('industryFilter');
+const sourceFilter = document.getElementById('sourceFilter');
+const cityFilter = document.getElementById('cityFilter');
+const stageFilter = document.getElementById('stageFilter');
+const btnFocusProject = document.getElementById('btnFocusProjectOnly');
+let focusProjectOnly = false;
+const btnFocusOwner = document.getElementById('btnFocusOwnerOnly');
+let focusOwnerOnly = false;
+const btnOvertime = document.getElementById('btnOvertimeOnly');
+let overtimeOnly = false;
+const btnDelayed = document.getElementById('btnDelayedOnly');
+let delayedOnly = false;
+
+function renderNoticeItem(d) {
+    var isCz = (d.source === '崇左阳光采购' || (d.link && d.link.indexOf('gxygcg.com') !== -1) || d.areaname === '崇左阳光采购');
+    var rawCity = d.areaname || (isCz ? '崇左市' : '崇左市');
+    var filterCity = mapToCityFilter(rawCity);
+    var cityLabel = esc(shortArea(d.areaname || (isCz ? '崇左阳光采购' : '崇左市')));
+    var isProj = (d.focus_tags && d.focus_tags.indexOf("重点项目") !== -1) ? 1 : 0;
+    var isOwner = (d.focus_tags && d.focus_tags.indexOf("重点业主") !== -1) ? 1 : 0;
+
+    var s = '<a class="notice-item"'
+          + ' data-title="' + esc(d.title) + '"'
+          + ' data-industry="' + esc(d.industry) + '"'
+          + ' data-source="' + (isCz ? '崇左阳光采购' : '广西公共资源交易平台') + '"'
+          + ' data-city="' + esc(d.areaname || '崇左市') + '"'
+          + ' data-stage="' + esc(d.stage || '其他') + '"'
+          + ' data-focus="' + (d.is_focus ? 1 : 0) + '"'
+          + ' data-focus-project="' + isProj + '"'
+          + ' data-focus-owner="' + isOwner + '"'
+          + ' data-overtime="' + (d.is_overtime ? 1 : 0) + '"'
+          + ' data-delayed="' + (d.is_delayed ? 1 : 0) + '"'
+          + ' href="' + esc(d.link) + '" rel="noopener noreferrer" target="_blank"'
+          + ' title="' + esc(d.title) + '">';
+    s += '<span class="city-tag" data-filter-city="' + esc(filterCity) + '" title="点击筛选【' + esc(filterCity || cityLabel) + '】（再次点击取消）">' + cityLabel + '</span>';
+    if (isCz) {
+        s += '<span class="city-tag source-tag" data-filter-source="崇左阳光采购" title="点击筛选【崇左阳光采购】（再次点击取消）" style="background:#fef3c7;color:#92400e;border-color:#fde68a;">崇左阳光采购</span>';
+    }
+    s += '<span class="notice-title">' + esc(d.title) + EXT_ICON + '</span>';
+    if (d.is_focus) {
+        var tags = d.focus_tags;
+        if (!tags || !tags.length) {
+            tags = ["重点项目"];
+        }
+        for (var ti = 0; ti < tags.length; ti++) {
+            var tname = tags[ti];
+            if (d.is_delayed && (tname === "滞后公开" || tname === "滞后补录")) {
+                continue;
+            }
+            var cls = "focus-chip";
+            var filterAttr = 'data-filter-focus="1"';
+            var icon = '';
+            if (tname === "重点项目") {
+                cls += " focus-chip-project";
+                filterAttr = 'data-filter-focus-project="1"';
+                icon = '🎯 ';
+            } else if (tname === "重点业主") {
+                cls += " focus-chip-owner";
+                filterAttr = 'data-filter-focus-owner="1"';
+                icon = '🏢 ';
+            }
+            else if (tname === "重点关键词") cls += " focus-chip-keyword";
+            else if (tname === "重点类型") cls += " focus-chip-type";
+            else cls += " focus-chip-project";
+            var rtip = Array.isArray(d.focus_reason) ? d.focus_reason.join("; ") : (d.focus_reason || tname);
+            s += '<span class="' + cls + '" ' + filterAttr + ' title="' + esc(rtip) + '（点击筛选' + esc(tname) + '）">' + icon + esc(tname) + '</span>';
+        }
+    }
+    if (d.is_overtime) {
+        var otTip = d.overtime_reason || '加班/非工作时间发布';
+        s += '<span class="overtime-chip" data-filter-overtime="1" title="' + esc(otTip) + '（点击筛选加班发布）">' + OT_ICON + '加班发布</span>';
+    }
+    if (d.is_delayed) {
+        var dLabel = d.delay_label || (d.delay_days >= 1 ? ('滞后 ' + d.delay_days + '天') : (d.delay_hours >= 1 ? ('滞后 ' + d.delay_hours + '小时') : '滞后公开'));
+        var delTip = d.delayed_reason || ('【存证判定】官网标称发布于 ' + (d.pub_time || '') + '，' + dLabel);
+        s += '<span class="delayed-chip" data-filter-delayed="1" title="' + esc(delTip) + '（点击筛选滞后公开）">' + DEL_ICON + esc(dLabel) + '</span>';
+    }
+    s += '<span class="notice-time">' + esc(String(d.pub_time || '').substring(5, 16)) + '</span>';
+    s += '</a>';
+    return s;
+}
+
+/* 三级明细渲染：工程类别 → 公告类型（业务环节）→ 条目 */
+function build() {
+    let html = '';
+    // 预先归一化 industry，防止意外值导致公告被跳过
+    RAW_DATA.forEach(function(d) {
+        if (d.industry === '房建市政') { d.industry = '房建市政工程'; }
+        if (IND_ORDER.indexOf(d.industry) === -1) { d.industry = '其他项目'; }
+    });
+    IND_ORDER.forEach(function (ind) {
+        const list = RAW_DATA.filter(function (d) { return d.industry === ind; });
+        if (!list.length) { return; }
+        const citySet = {};
+        list.forEach(function (d) { citySet[shortArea(d.areaname)] = 1; });
+        const cityCount = Object.keys(citySet).length;
+
+        html += '<section class="cat-block" data-cat="' + esc(ind) + '">';
+        html += '<div class="cat-header"><div class="cat-title-group" data-filter-cat="' + esc(ind) + '" title="点击筛选【' + esc(ind) + '】大类（再次点击取消）">';
+        html += '<div class="cat-icon">' + CAT_ICON[ind] + '</div>';
+        html += '<span class="cat-heading">' + esc(ind) + '</span>';
+        html += '<span class="cat-chip" data-filter-cat="' + esc(ind) + '" data-cities="' + cityCount + '" data-total="' + list.length + '" title="点击筛选【' + esc(ind) + '】大类（再次点击取消）">'
+              + list.length + ' 条 · ' + cityCount + ' 个地市</span>';
+        html += '</div></div>';
+
+        STAGE_ORDER.forEach(function (stage) {
+            const sub = list.filter(function (d) { return d.stage === stage; });
+            if (!sub.length) { return; }
+            html += '<div class="type-block" data-type="' + esc(stage) + '">';
+            html += '<div class="type-head" data-filter-stage="' + esc(stage) + '" title="点击筛选【' + esc(stage) + '】（再次点击取消）"><span class="type-bar"></span>'
+                  + '<span class="type-name">' + esc(stage) + '</span>'
+                  + '<span class="type-count" data-total="' + sub.length + '">(' + sub.length + ' 条)</span></div>';
+            html += '<div class="notice-list">';
+            sub.forEach(function (d) { html += renderNoticeItem(d); });
+            html += '</div></div>';
+        });
+
+        const otherStages = list.filter(function (d) { return STAGE_ORDER.indexOf(d.stage) === -1; });
+        if (otherStages.length > 0) {
+            html += '<div class="type-block" data-type="其他环节">';
+            html += '<div class="type-head" data-filter-stage="其他环节" title="点击筛选【其他公告】（再次点击取消）"><span class="type-bar"></span>'
+                  + '<span class="type-name">其他公告</span>'
+                  + '<span class="type-count" data-total="' + otherStages.length + '">(' + otherStages.length + ' 条)</span></div>';
+            html += '<div class="notice-list">';
+            otherStages.forEach(function (d) { html += renderNoticeItem(d); });
+            html += '</div></div>';
+        }
+
+        html += '</section>';
+    });
+    container.innerHTML = html;
+}
+
+/* 筛选：搜索词 + 工程大类 + 地市 + 业务环节 + 重点预警 */
+function apply() {
+    const q = (searchInput.value || '').trim().toLowerCase();
+    const ind = industryFilter.value;
+    const src = sourceFilter ? sourceFilter.value : '';
+   const city = cityFilter.value;
+   const stage = stageFilter.value;
+   let shown = 0;
+
+   var gBox = document.getElementById('globalSearchResults');
+   if (q) {
+        if (!window.__GLOBAL_SEARCH_INDEX__) {
+            hint.innerHTML = '🔍 正在全盘检索所有历史日期的公告...';
+            if (!window.__SEARCH_FETCHING__) {
+                window.__SEARCH_FETCHING__ = true;
+                fetch('./search_index.json')
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        window.__GLOBAL_SEARCH_INDEX__ = data || [];
+                        window.__SEARCH_FETCHING__ = false;
+                        apply();
+                    })
+                    .catch(function(err) {
+                        console.error('Failed to load global search index', err);
+                        window.__SEARCH_FETCHING__ = false;
+                    });
+            }
+            return;
+        }
+
+        // 已加载全历史索引，跨所有日期检索展示
+        container.style.display = 'none';
+        if (gBox) gBox.style.display = 'block';
+
+        var matches = window.__GLOBAL_SEARCH_INDEX__.filter(function(it) {
+            var title = (it.title || '').toLowerCase();
+            var area = (it.areaname || '').toLowerCase();
+            var industry = (it.industry || '').toLowerCase();
+            var stageName = (it.stage || '').toLowerCase();
+            if (title.indexOf(q) === -1 && area.indexOf(q) === -1 && industry.indexOf(q) === -1 && stageName.indexOf(q) === -1) {
+                return false;
+            }
+            if (ind && it.industry !== ind) return false;
+            if (src && it.source !== src) return false;
+            if (city) {
+                var itemCity = it.areaname || '';
+                if (city === '崇左市') {
+                    if (itemCity.indexOf('崇左') === -1 && itemCity.indexOf('龙州') === -1 && itemCity.indexOf('扶绥') === -1 && itemCity.indexOf('宁明') === -1 && itemCity.indexOf('凭祥') === -1 && itemCity.indexOf('大新') === -1 && itemCity.indexOf('天等') === -1) {
+                        return false;
+                    }
+                } else if (itemCity.indexOf(city) === -1) {
+                    return false;
+                }
+            }
+            if (stage && it.stage !== stage) return false;
+            if (focusProjectOnly) {
+                var p = (it.focus_tags || []).indexOf('重点项目') !== -1;
+                if (!p && !it.is_focus) return false;
+            }
+            if (focusOwnerOnly) {
+                var o = (it.focus_tags || []).indexOf('重点业主') !== -1;
+                if (!o) return false;
+            }
+            if (overtimeOnly && !it.is_overtime) return false;
+            if (delayedOnly && !it.is_delayed) return false;
+            return true;
+        });
+
+        matches.sort(function(a, b) {
+            var ta = a.pub_time || a.date || '';
+            var tb = b.pub_time || b.date || '';
+            return tb.localeCompare(ta);
+        });
+
+        hint.innerHTML = '🌐 全盘检索结果：在所有历史日期中找到 <strong>' + matches.length + '</strong> 条符合「' + esc(q) + '」的公告（不限日期，按发布时间倒序排列） · <a href="javascript:void(0)" onclick="document.getElementById(\\'searchInput\\').value=\\'\\';apply();" style="color:#0284c7;font-weight:700;margin-left:6px;text-decoration:underline;">✕ 清除搜索返回今日</a>';
+        empty.style.display = 'none';
+
+        if (matches.length === 0) {
+            if (gBox) gBox.innerHTML = '<div class="empty-search-state" style="display:block;"><h3>在所有历史日期的公告中均未找到包含「' + esc(q) + '」的标讯</h3><p style="margin-top:6px;color:#64748b;">请尝试缩短或更换关键词检索</p></div>';
+        } else if (gBox) {
+            var html = '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:10px 14px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+                + '<div style="font-size:13px;color:#0369a1;"><strong>🌐 跨所有日期检索结果</strong> · 共找到 <strong>' + matches.length + '</strong> 条匹配公告（已跨全部历史日期）</div>'
+                + '<a href="./search.html?q=' + encodeURIComponent(q) + '" style="font-size:12px;color:#0284c7;font-weight:700;text-decoration:none;">在全盘检索独立页查看 ↗</a>'
+                + '</div>';
+            html += '<div class="notice-list" style="display:flex;flex-direction:column;gap:6px;">';
+            matches.forEach(function(d) {
+                var dateBadge = '<a href="./' + (d.date || '') + '.html" title="点击查看 ' + (d.date || '') + ' 当日完整日报" style="flex-shrink:0;background:#e0f2fe;color:#0369a1;font-weight:700;font-size:11px;padding:2px 6px;border-radius:4px;text-decoration:none;border:1px solid #bae6fd;display:inline-flex;align-items:center;gap:2px;">📅 ' + (d.date || '') + '</a>';
+                var cityBadge = '<span class="city-tag" style="flex-shrink:0;">' + esc(shortArea(d.areaname)) + '</span>';
+                var indBadge = '<span class="cat-tag" style="flex-shrink:0;background:#f1f5f9;color:#475569;font-size:11px;padding:2px 6px;border-radius:4px;">' + esc(d.industry || '综合') + '</span>';
+                var stageBadge = '<span class="stage-tag" style="flex-shrink:0;background:#f8fafc;color:#64748b;font-size:11px;padding:2px 6px;border-radius:4px;border:1px solid #e2e8f0;">' + esc(d.stage || '公告') + '</span>';
+
+               var titleHighlighted = esc(d.title || '');
+               if (q) {
+                    var safeQ = q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                    var re = new RegExp('(' + safeQ + ')', 'gi');
+                   titleHighlighted = titleHighlighted.replace(re, '<mark style="background:#fef08a;color:#854d0e;padding:0 2px;border-radius:2px;">$1</mark>');
+               }
+
+                var extraTags = '';
+                if (d.is_focus) {
+                    extraTags += '<span class="focus-chip" style="background:#eff6ff;color:#1d4ed8;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;border:1px solid #bfdbfe;">重点</span>';
+                }
+                if (d.is_overtime) {
+                    extraTags += '<span class="overtime-chip" style="background:#fdf4ff;color:#a21caf;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;border:1px solid #f5d0fe;">🌙 加班</span>';
+                }
+                if (d.is_delayed) {
+                    extraTags += '<span class="delayed-chip" style="background:#fff1f2;color:#be123c;font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;border:1px solid #fecdd3;">⚠️ 滞后</span>';
+                }
+
+                var timeStr = (d.pub_time || '').length >= 16 ? d.pub_time.substring(11, 16) : '';
+                var timeBadge = timeStr ? '<span class="notice-time" style="flex-shrink:0;font-size:11px;color:#94a3b8;font-family:monospace;">' + timeStr + '</span>' : '';
+
+                html += '<div class="notice-item" style="border-left:3px solid #0284c7;background:#fff;padding:8px 12px;border-radius:6px;box-shadow:0 1px 2px rgba(0,0,0,0.04);display:flex;align-items:center;gap:8px;text-decoration:none;color:inherit;">'
+                    + dateBadge + cityBadge + indBadge + stageBadge
+                    + '<a href="' + esc(d.link || '#') + '" target="_blank" rel="noopener noreferrer" style="flex:1;font-weight:600;font-size:13px;color:#0f172a;line-height:1.4;text-decoration:none;display:inline-flex;align-items:center;gap:4px;" class="notice-title">'
+                    + titleHighlighted + ' ' + EXT_ICON + '</a>'
+                    + extraTags + timeBadge + '</div>';
+            });
+            html += '</div>';
+            gBox.innerHTML = html;
+        }
+        return;
+    }
+
+   // q 为空时恢复单日视图
+   if (gBox) gBox.style.display = 'none';
+   container.style.display = 'block';
+    Array.prototype.forEach.call(container.querySelectorAll('.notice-item'), function (it) {
+       let ok = true;
+       if (q) {
+            const hay = (it.getAttribute('data-title') || '').toLowerCase();
+            if (hay.indexOf(q) === -1) { ok = false; }
+        }
+        if (ok && ind && it.getAttribute('data-industry') !== ind) { ok = false; }
+        if (ok && src && it.getAttribute('data-source') !== src) { ok = false; }
+        if (ok && city) {
+            const itemCity = it.getAttribute('data-city') || '';
+            if (city === '崇左市') {
+                if (itemCity.indexOf('崇左') === -1 && itemCity.indexOf('龙州') === -1 && itemCity.indexOf('扶绥') === -1 && itemCity.indexOf('宁明') === -1 && itemCity.indexOf('凭祥') === -1 && itemCity.indexOf('大新') === -1 && itemCity.indexOf('天等') === -1) {
+                    ok = false;
+                }
+            } else if (itemCity.indexOf(city) === -1) {
+                ok = false;
+            }
+        }
+        if (ok && stage && it.getAttribute('data-stage') !== stage) { ok = false; }
+        if (ok && focusProjectOnly && it.getAttribute('data-focus-project') !== '1') { ok = false; }
+        if (ok && focusOwnerOnly && it.getAttribute('data-focus-owner') !== '1') { ok = false; }
+        if (ok && overtimeOnly && it.getAttribute('data-overtime') !== '1') { ok = false; }
+        if (ok && delayedOnly && it.getAttribute('data-delayed') !== '1') { ok = false; }
+        it.hidden = !ok;
+        if (ok) { shown++; }
+    });
+
+    Array.prototype.forEach.call(container.querySelectorAll('.type-block'), function (tb) {
+        const vis = tb.querySelectorAll('.notice-item:not([hidden])').length;
+        tb.hidden = vis === 0;
+        const chip = tb.querySelector('.type-count');
+        if (chip) {
+            const total = Number(chip.getAttribute('data-total'));
+            chip.textContent = '(' + (vis === total ? total : vis + ' / ' + total) + ' 条)';
+        }
+    });
+
+    Array.prototype.forEach.call(container.querySelectorAll('.cat-block'), function (cb) {
+        const vis = cb.querySelectorAll('.notice-item:not([hidden])').length;
+        cb.hidden = vis === 0;
+        const chip = cb.querySelector('.cat-chip');
+        if (chip) {
+            const total = Number(chip.getAttribute('data-total'));
+            chip.textContent = (vis === total ? total : vis + ' / ' + total)
+                             + ' 条 · ' + chip.getAttribute('data-cities') + ' 个地市';
+        }
+    });
+
+    if (q) {
+        hint.innerHTML = '当日匹配 <strong>' + shown + '</strong> 条 · <a href="./search.html?q=' + encodeURIComponent(q) + '" style="color:#0284c7;font-weight:700;text-decoration:underline;margin-left:6px;">🔍 查看全盘历史中所有包含「' + esc(q) + '」的讯息 →</a>';
+    } else {
+        hint.innerHTML = '当前筛选匹配 <strong>' + shown + '</strong> 条标讯';
+    }
+    if (shown === 0) {
+        empty.style.display = 'block';
+        if (q) {
+            empty.innerHTML = '<h3>当日未匹配到包含「' + esc(q) + '」的公告</h3><p style="margin-top:8px;"><a href="./search.html?q=' + encodeURIComponent(q) + '" style="display:inline-block;padding:8px 16px;background:#0284c7;color:#fff;border-radius:6px;text-decoration:none;font-weight:700;">🔍 立即进行全盘检索（搜索全历史所有公告）</a></p>';
+        }
+    } else {
+        empty.style.display = 'none';
+    }
+
+    /* 同步高亮业务环节与重点信息统计卡激活状态 */
+    document.querySelectorAll('.stat-box.clickable').forEach(function(box) {
+        var st = box.getAttribute('data-stage');
+        if (st === '__focus_project__') {
+            box.classList.toggle('active', focusProjectOnly);
+        } else if (st === '__focus_owner__') {
+            box.classList.toggle('active', focusOwnerOnly);
+        } else if (stage && st === stage) {
+            box.classList.add('active');
+        } else {
+            box.classList.remove('active');
+        }
+    });
+
+    /* 同步各胶囊的高亮与激活状态 */
+    document.querySelectorAll('.type-head').forEach(function(th) {
+        var s = th.getAttribute('data-filter-stage');
+        th.classList.toggle('active-filter', !!stage && s === stage);
+    });
+    document.querySelectorAll('.city-tag[data-filter-city]').forEach(function(ct) {
+        var c = ct.getAttribute('data-filter-city');
+        ct.classList.toggle('active-filter', !!city && c === city);
+    });
+    document.querySelectorAll('.source-tag[data-filter-source]').forEach(function(st) {
+        var s = st.getAttribute('data-filter-source');
+        st.classList.toggle('active-filter', !!src && s === src);
+    });
+    document.querySelectorAll('.cat-chip[data-filter-cat]').forEach(function(cc) {
+        var c = cc.getAttribute('data-filter-cat');
+        cc.classList.toggle('active-filter', !!ind && c === ind);
+    });
+    document.querySelectorAll('.focus-chip-project').forEach(function(fc) {
+        fc.classList.toggle('active-filter', focusProjectOnly);
+    });
+    document.querySelectorAll('.focus-chip-owner').forEach(function(fc) {
+        fc.classList.toggle('active-filter', focusOwnerOnly);
+    });
+    document.querySelectorAll('.overtime-chip').forEach(function(oc) {
+        oc.classList.toggle('active-filter', overtimeOnly);
+    });
+    document.querySelectorAll('.delayed-chip').forEach(function(dc) {
+        dc.classList.toggle('active-filter', delayedOnly);
+    });
+}
+
+    searchInput.addEventListener('input', apply);
+    searchInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            var val = (searchInput.value || '').trim();
+            if (val) {
+                window.location.href = './search.html?q=' + encodeURIComponent(val);
+            }
+        }
+    });
+industryFilter.addEventListener('change', apply);
+if (sourceFilter) sourceFilter.addEventListener('change', apply);
+cityFilter.addEventListener('change', apply);
+stageFilter.addEventListener('change', apply);
+
+function clearSpecialFilters() {
+    focusProjectOnly = false;
+    if (btnFocusProject) btnFocusProject.classList.remove('active');
+    focusOwnerOnly = false;
+    if (btnFocusOwner) btnFocusOwner.classList.remove('active');
+    overtimeOnly = false;
+    if (btnOvertime) btnOvertime.classList.remove('active');
+    delayedOnly = false;
+    if (btnDelayed) btnDelayed.classList.remove('active');
+}
+
+if (btnFocusProject) {
+    btnFocusProject.addEventListener('click', function () {
+        var willActive = !focusProjectOnly;
+        clearSpecialFilters();
+        if (willActive) {
+            focusProjectOnly = true;
+            this.classList.add('active');
+            showFilterToast('已筛选：🎯 重点项目');
+        } else {
+            showFilterToast('已取消重点项目筛选');
+        }
+        apply();
+    });
+}
+if (btnFocusOwner) {
+    btnFocusOwner.addEventListener('click', function () {
+        var willActive = !focusOwnerOnly;
+        clearSpecialFilters();
+        if (willActive) {
+            focusOwnerOnly = true;
+            this.classList.add('active');
+            showFilterToast('已筛选：🏢 重点业主');
+        } else {
+            showFilterToast('已取消重点业主筛选');
+        }
+        apply();
+    });
+}
+
+if (btnOvertime) {
+    btnOvertime.addEventListener('click', function () {
+        var willActive = !overtimeOnly;
+        clearSpecialFilters();
+        if (willActive) {
+            overtimeOnly = true;
+            this.classList.add('active');
+            showFilterToast('已筛选：🌙 加班发布');
+        } else {
+            showFilterToast('已取消加班发布筛选');
+        }
+        apply();
+    });
+}
+
+if (btnDelayed) {
+    btnDelayed.addEventListener('click', function () {
+        var willActive = !delayedOnly;
+        clearSpecialFilters();
+        if (willActive) {
+            delayedOnly = true;
+            this.classList.add('active');
+            showFilterToast('已筛选：⚠️ 滞后公开');
+            var alertBox = document.getElementById('delayedAlertBox');
+            if (alertBox) {
+                alertBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        } else {
+            showFilterToast('已取消滞后公开筛选');
+        }
+        apply();
+    });
+}
+
+document.getElementById('btnReset').addEventListener('click', function () {
+    searchInput.value = '';
+    industryFilter.value = '';
+    if (sourceFilter) sourceFilter.value = '';
+    cityFilter.value = '';
+    stageFilter.value = '';
+    clearSpecialFilters();
+    apply();
+    showFilterToast('已重置所有筛选条件');
+});
+
+function resetFiltersExcept(except) {
+    if (except !== 'stage' && stageFilter) stageFilter.value = '';
+    if (except !== 'source' && sourceFilter) sourceFilter.value = '';
+    if (except !== 'city' && cityFilter) cityFilter.value = '';
+    if (except !== 'cat' && industryFilter) industryFilter.value = '';
+    if (except !== 'keyword' && searchInput) searchInput.value = '';
+    if (except !== 'focus_project') {
+        focusProjectOnly = false;
+        if (btnFocusProject) btnFocusProject.classList.remove('active');
+    }
+    if (except !== 'focus_owner') {
+        focusOwnerOnly = false;
+        if (btnFocusOwner) btnFocusOwner.classList.remove('active');
+    }
+    if (except !== 'overtime') {
+        overtimeOnly = false;
+        if (btnOvertime) btnOvertime.classList.remove('active');
+    }
+    if (except !== 'delayed') {
+        delayedOnly = false;
+        if (btnDelayed) btnDelayed.classList.remove('active');
+    }
+}
+
+/* 统计卡点击联动筛选与平滑滚动 */
+document.querySelectorAll('.stat-box.clickable').forEach(function(box) {
+    box.addEventListener('click', function() {
+        var targetStage = this.getAttribute('data-stage');
+        if (targetStage === '__focus_project__') {
+            var wasActive = (focusProjectOnly && !focusOwnerOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('focus_project');
+            if (wasActive) {
+                focusProjectOnly = false;
+                if (btnFocusProject) btnFocusProject.classList.remove('active');
+                showFilterToast('已取消重点项目筛选');
+            } else {
+                focusProjectOnly = true;
+                if (btnFocusProject) btnFocusProject.classList.add('active');
+                showFilterToast('已切换至重点项目筛选');
+            }
+        } else if (targetStage === '__focus_owner__') {
+            var wasActive = (focusOwnerOnly && !focusProjectOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('focus_owner');
+            if (wasActive) {
+                focusOwnerOnly = false;
+                if (btnFocusOwner) btnFocusOwner.classList.remove('active');
+                showFilterToast('已取消重点业主筛选');
+            } else {
+                focusOwnerOnly = true;
+                if (btnFocusOwner) btnFocusOwner.classList.add('active');
+                showFilterToast('已切换至重点业主筛选');
+            }
+        } else {
+            var wasActive = (stageFilter.value === targetStage && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('stage');
+            if (wasActive) {
+                stageFilter.value = '';
+                showFilterToast('已取消环节筛选');
+            } else {
+                stageFilter.value = targetStage;
+                showFilterToast('已按环节筛选：' + targetStage);
+            }
+        }
+        apply();
+        var filterEl = document.querySelector('.filter-section.daily');
+        if (filterEl) {
+            filterEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    });
+});
+
+/* 点击页面内各种胶囊直接触发单维度聚焦筛选（点击即为此胶囊筛选，不叠加历史胶囊） */
+container.addEventListener('click', function(e) {
+    // 1. 业务环节胶囊 (中标公示、中标公告等)
+    var typeHead = e.target.closest('.type-head');
+    if (typeHead) {
+        e.preventDefault();
+        e.stopPropagation();
+        var targetStage = typeHead.getAttribute('data-filter-stage');
+        if (!targetStage) {
+            var tb = typeHead.closest('.type-block');
+            targetStage = tb ? tb.getAttribute('data-type') : '';
+        }
+        if (targetStage) {
+            var wasActive = (stageFilter.value === targetStage && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('stage');
+            if (wasActive) {
+                stageFilter.value = '';
+                showFilterToast('已取消环节筛选');
+            } else {
+                stageFilter.value = targetStage;
+                showFilterToast('已按环节筛选：' + targetStage);
+            }
+            apply();
+            checkScrollAfterFilter();
+        }
+        return;
+    }
+
+    // 2. 信源胶囊 (崇左阳光采购)
+    var sourceTag = e.target.closest('.source-tag');
+    if (sourceTag) {
+        e.preventDefault();
+        e.stopPropagation();
+        var targetSource = sourceTag.getAttribute('data-filter-source') || sourceTag.textContent.trim();
+        if (targetSource && sourceFilter) {
+            var wasActive = (sourceFilter.value === targetSource && !stageFilter.value && !cityFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('source');
+            if (wasActive) {
+                sourceFilter.value = '';
+                showFilterToast('已恢复全部平台信源');
+            } else {
+                sourceFilter.value = targetSource;
+                showFilterToast('已筛选平台信源：' + targetSource);
+            }
+            apply();
+            checkScrollAfterFilter();
+        }
+        return;
+    }
+
+    // 3. 地市胶囊 (来宾、崇左、柳州、区中心等)
+    var cityTag = e.target.closest('.city-tag');
+    if (cityTag) {
+        e.preventDefault();
+        e.stopPropagation();
+        var targetCity = cityTag.getAttribute('data-filter-city');
+        if (!targetCity) {
+            var it = cityTag.closest('.notice-item');
+            var rawCity = it ? it.getAttribute('data-city') : cityTag.textContent.trim();
+            targetCity = mapToCityFilter(rawCity);
+        }
+        if (targetCity) {
+            var wasActive = (cityFilter.value === targetCity && !stageFilter.value && !sourceFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('city');
+            if (wasActive) {
+                cityFilter.value = '';
+                showFilterToast('已恢复全部地市');
+            } else {
+                cityFilter.value = targetCity;
+                showFilterToast('已筛选地市：' + targetCity);
+            }
+            apply();
+            checkScrollAfterFilter();
+        }
+        return;
+    }
+
+    // 4. 工程大类胶囊 (水利工程、市政公用等)
+    var catEl = e.target.closest('.cat-chip, .cat-heading, .cat-title-group');
+    if (catEl) {
+        e.preventDefault();
+        e.stopPropagation();
+        var catBlock = catEl.closest('.cat-block');
+        var targetCat = catEl.getAttribute('data-filter-cat') || (catBlock ? catBlock.getAttribute('data-cat') : '');
+        if (targetCat) {
+            var wasActive = (industryFilter.value === targetCat && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !delayedOnly && !searchInput.value);
+            resetFiltersExcept('cat');
+            if (wasActive) {
+                industryFilter.value = '';
+                showFilterToast('已恢复全部工程大类');
+            } else {
+                industryFilter.value = targetCat;
+                showFilterToast('已筛选工程大类：' + targetCat);
+            }
+            apply();
+            checkScrollAfterFilter();
+        }
+        return;
+    }
+
+    // 5. 重点项目胶囊
+    var projChip = e.target.closest('.focus-chip-project');
+    if (projChip) {
+        e.preventDefault();
+        e.stopPropagation();
+        var wasActive = (focusProjectOnly && !focusOwnerOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !delayedOnly && !overtimeOnly && !searchInput.value);
+        resetFiltersExcept('focus_project');
+        if (wasActive) {
+            focusProjectOnly = false;
+            if (btnFocusProject) btnFocusProject.classList.remove('active');
+            showFilterToast('已取消重点项目筛选');
+        } else {
+            focusProjectOnly = true;
+            if (btnFocusProject) btnFocusProject.classList.add('active');
+            showFilterToast('已筛选：🎯 重点项目');
+        }
+        apply();
+        checkScrollAfterFilter();
+        return;
+    }
+
+    // 6. 重点业主胶囊
+    var ownerChip = e.target.closest('.focus-chip-owner');
+    if (ownerChip) {
+        e.preventDefault();
+        e.stopPropagation();
+        var wasActive = (focusOwnerOnly && !focusProjectOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !delayedOnly && !overtimeOnly && !searchInput.value);
+        resetFiltersExcept('focus_owner');
+        if (wasActive) {
+            focusOwnerOnly = false;
+            if (btnFocusOwner) btnFocusOwner.classList.remove('active');
+            showFilterToast('已取消重点业主筛选');
+        } else {
+            focusOwnerOnly = true;
+            if (btnFocusOwner) btnFocusOwner.classList.add('active');
+            showFilterToast('已筛选：🏢 重点业主');
+        }
+        apply();
+        checkScrollAfterFilter();
+        return;
+    }
+
+    // 7. 加班发布胶囊
+    var otChip = e.target.closest('.overtime-chip');
+    if (otChip) {
+        e.preventDefault();
+        e.stopPropagation();
+        var wasActive = (overtimeOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !delayedOnly && !searchInput.value);
+        resetFiltersExcept('overtime');
+        if (wasActive) {
+            overtimeOnly = false;
+            if (btnOvertime) btnOvertime.classList.remove('active');
+            showFilterToast('已取消加班发布筛选');
+        } else {
+            overtimeOnly = true;
+            if (btnOvertime) btnOvertime.classList.add('active');
+            showFilterToast('已筛选加班发布标讯');
+        }
+        apply();
+        checkScrollAfterFilter();
+        return;
+    }
+
+    // 7. 滞后公开胶囊
+    var delChip = e.target.closest('.delayed-chip');
+    if (delChip) {
+        e.preventDefault();
+        e.stopPropagation();
+        var wasActive = (delayedOnly && !stageFilter.value && !sourceFilter.value && !cityFilter.value && !industryFilter.value && !focusProjectOnly && !focusOwnerOnly && !overtimeOnly && !searchInput.value);
+        resetFiltersExcept('delayed');
+        if (wasActive) {
+            delayedOnly = false;
+            if (btnDelayed) btnDelayed.classList.remove('active');
+            showFilterToast('已取消滞后公开筛选');
+        } else {
+            delayedOnly = true;
+            if (btnDelayed) btnDelayed.classList.add('active');
+            showFilterToast('已筛选滞后公开标讯');
+        }
+        apply();
+        checkScrollAfterFilter();
+        return;
+    }
+});
+
+var projCnt = RAW_DATA.filter(function (d) { return d.focus_tags && d.focus_tags.indexOf("重点项目") !== -1; }).length;
+var ownerCnt = RAW_DATA.filter(function (d) { return d.focus_tags && d.focus_tags.indexOf("重点业主") !== -1; }).length;
+var elProjCount = document.getElementById('focusProjectCount');
+if (elProjCount) elProjCount.textContent = projCnt;
+var elOwnerCount = document.getElementById('focusOwnerCount');
+if (elOwnerCount) elOwnerCount.textContent = ownerCnt;
+
+const otCountEl = document.getElementById('overtimeCount');
+if (otCountEl) otCountEl.textContent = RAW_DATA.filter(function (d) { return d.is_overtime; }).length;
+const delCountEl = document.getElementById('delayedCount');
+if (delCountEl) {
+    var rawDelCnt = RAW_DATA.filter(function (d) { return d.is_delayed; }).length;
+    var extraDelCnt = (typeof DELAYED_DATA !== 'undefined' && Array.isArray(DELAYED_DATA)) ? DELAYED_DATA.length : 0;
+    delCountEl.textContent = rawDelCnt + extraDelCnt;
+}
+var statProjEl = document.getElementById('stat-focus-project');
+if (statProjEl && statProjEl.firstChild) {
+    statProjEl.firstChild.textContent = projCnt;
+}
+var statOwnerEl = document.getElementById('stat-focus-owner');
+if (statOwnerEl && statOwnerEl.firstChild) {
+    statOwnerEl.firstChild.textContent = ownerCnt;
+}
+
+build();
+apply();
+</script>
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------ 4. 变量注入
+html = PAGE
+html = html.replace("__PREVIEW_CSS__", PREVIEW_CSS)
+html = html.replace("__DAILY_CSS__", DAILY_CSS.strip())
+html = html.replace("__LATEST_PUB__", latest_pub)
+html = html.replace("__SCAN_TIME__", scan_time)
+html = html.replace("__LATEST__", latest_pub)
+html = html.replace("__APP_VERSION__", getattr(config, "APP_VERSION", "v0.3.7"))
+html = html.replace("__DATE__", DAY)
+html = html.replace("__PREV_URL__", neighbor_url(-1))
+html = html.replace("__NEXT_URL__", neighbor_url(1))
+
+# 构建滞后公告横幅 HTML（支持展示今日回扫发现的前期遗漏，或历史单日归档中确证滞后补录的条目）
+alert_items = list(today_delayed_items)
+is_historical_day = False
+if not alert_items:
+    alert_items = [it for it in items if it.get("is_delayed")]
+    if alert_items:
+        is_historical_day = True
+
+if alert_items:
+    rows_h = []
+    for dit in alert_items:
+        d_delay = dit.get("delay_days", 0)
+        d_hours = dit.get("delay_hours", 0)
+        d_label = dit.get("delay_label") or (f"滞后 {d_delay}天" if d_delay >= 1 else (f"滞后 {d_hours}小时" if d_hours >= 1 else "滞后公开"))
+        d_title = html_mod.escape(dit.get("title", ""))
+        d_link = html_mod.escape(dit.get("link") or dit.get("detail_url") or "#")
+        d_pub = html_mod.escape(str(dit.get("pub_time", ""))[:16])
+        d_area = html_mod.escape(str(dit.get("areaname", "") or dit.get("source", "")))
+        d_stage = html_mod.escape(str(dit.get("stage", "") or "公告"))
+        tag_text = "回溯确证补录" if is_historical_day else "今日回扫捕获"
+        rows_h.append(
+            f'<a class="delayed-item-row" href="{d_link}" target="_blank" rel="noopener noreferrer">\n'
+            f'    <div class="delayed-item-main">\n'
+            f'        <span class="delayed-days-tag" style="border-radius:9999px;padding:2px 8px;">{d_label}</span>\n'
+            f'        <span class="delayed-item-title">{d_title}</span>\n'
+            f'    </div>\n'
+            f'    <div class="delayed-item-meta">\n'
+            f'        <span>【{d_area}·{d_stage}】</span>\n'
+            f'        <span>官方标称: {d_pub}</span>\n'
+            f'        <span style="color:#ea580c;font-weight:700;">{tag_text}</span>\n'
+            f'    </div>\n'
+            f'</a>'
+        )
+    
+    total_d_cnt = len(rows_h)
+    if total_d_cnt > 5:
+        top_rows = "".join(rows_h[:5])
+        more_rows = "".join(rows_h[5:])
+        list_inner = (
+            f'{top_rows}\n'
+            f'<div id="delayedAlertMore" style="display:none;flex-direction:column;gap:8px;">{more_rows}</div>\n'
+            f'<button type="button" class="btn-toggle-delayed-more" id="btnToggleDelayedMore"'
+            f' onclick="var el=document.getElementById(\'delayedAlertMore\');'
+            f'if(el.style.display===\'none\'){{el.style.display=\'flex\';this.textContent=\'收起其余 {total_d_cnt - 5} 条 ▲\';}}'
+            f'else{{el.style.display=\'none\';this.textContent=\'展开查看全部 {total_d_cnt} 条滞后公开项目（已显示前 5 条） ▼\';}}">'
+            f'展开查看全部 {total_d_cnt} 条滞后公开项目（已显示前 5 条） ▼</button>'
+        )
+    else:
+        list_inner = "".join(rows_h)
+
+    badge_text = "🚨 滞后公开存证" if is_historical_day else "🚨 历史回扫特别预警"
+    title_text = f"本日收录 <strong>{len(alert_items)}</strong> 条被官方滞后公开的项目" if is_historical_day else f"今日回扫捕获 <strong>{len(alert_items)}</strong> 条被官方滞后公开的项目"
+    desc_text = "官方标称发布于本日，但在当日正常扫描窗口未见该条目，后续由回扫系统确证补录" if is_historical_day else "官方标称发布于 2~30 天前，此前巡检未见该条目，在今日定时回扫中首次扫描捕获并确证存证"
+
+    delayed_alert_html = (
+        f'<div class="delayed-alert-box" id="delayedAlertBox">\n'
+        f'    <div class="delayed-alert-header">\n'
+        f'        <div class="delayed-alert-title-row">\n'
+            f'            <span class="delayed-alert-badge" style="border-radius:9999px;">{badge_text}</span>\n'
+            f'            <span class="delayed-alert-title">{title_text}</span>\n'
+        f'        </div>\n'
+        f'        <div class="delayed-alert-desc">{desc_text}</div>\n'
+        f'    </div>\n'
+        f'    <div class="delayed-alert-list">\n'
+        f'        {list_inner}\n'
+        f'    </div>\n'
+        f'</div>'
+    )
+else:
+    delayed_alert_html = ""
+
+html = html.replace("__DELAYED_ALERT_BOX__", delayed_alert_html)
+html = html.replace("__DELAYED_DATA__", json.dumps(today_delayed_items, ensure_ascii=False), 1)
+
+lines = ",\n".join("    " + json.dumps(it, ensure_ascii=False) for it in items)
+html = html.replace("__RAW_DATA__", lines, 1)
+
+for sid, val in stat_map.items():
+    html, n = re.subn(r'(id="%s">)0(<span class="sb-unit")' % sid, lambda m: m.group(1) + str(val) + m.group(2), html)
+    assert n == 1, sid
+
+html, n = re.subn(r'(id="focusProjectCount">)0(<)', lambda m: m.group(1) + str(focus_proj_n) + m.group(2), html)
+assert n == 1, "focusProjectCount"
+html, n = re.subn(r'(id="focusOwnerCount">)0(<)', lambda m: m.group(1) + str(focus_owner_n) + m.group(2), html)
+assert n == 1, "focusOwnerCount"
+overtime_n = sum(1 for it in items if it.get("is_overtime"))
+html, n = re.subn(r'(id="overtimeCount">)0(<)', lambda m: m.group(1) + str(overtime_n) + m.group(2), html)
+assert n == 1, "overtimeCount"
+html, n = re.subn(r'(id="delayedCount">)0(<)', lambda m: m.group(1) + str(delayed_n) + m.group(2), html)
+assert n == 1, "delayedCount"
+html = html.replace("当前筛选匹配 <strong>0</strong>", "当前筛选匹配 <strong>%d</strong>" % total_n, 1)
+
+is_past_day = (DAY < config.today())
+is_final_page = bool(getattr(ARGS, "final", False) or (config.STATE_DIR / ("final-%s.json" % DAY)).exists() or is_past_day)
+if is_final_page:
+    html = html.replace(
+        '<div class="hero-badge">',
+        '<div class="hero-badge hero-badge-final">'
+    )
+    html = html.replace(
+        '<span>DAILY BRIEFING · %s</span>' % DAY,
+        '<span>DAILY BRIEFING · %s · 终版封存</span>' % DAY
+    )
+    html = html.replace(
+        '<h2 class="hero-title">广西全区招投标公告日报（%s）</h2>' % DAY,
+        '<h2 class="hero-title">广西全区招投标公告日报（%s）<span class="final-tag-chip"><svg fill="none" stroke="currentColor" stroke-width="2.5" height="12" viewBox="0 0 24 24" width="12" style="display:inline-block"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> 终版</span></h2>' % DAY
+    )
+    # 所有不是今天的过去再次最终出来的结果都是封装：确保存证状态写盘
+    stamp = config.now_stamp()
+    final_file = config.STATE_DIR / ("final-%s.json" % DAY)
+    if not final_file.exists():
+        final_file.parent.mkdir(parents=True, exist_ok=True)
+        final_data = {
+            "date": DAY,
+            "is_final": True,
+            "finalized_at": stamp,
+            "total_items": total_n,
+            "sealed_reason": "past_date_auto_sealed" if is_past_day else "manual_final"
+        }
+        final_file.write_text(json.dumps(final_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ------------------------------------------------------------------ 5. 备份旧产物并写盘
+if OUT.exists():
+    TMPDIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(OUT, TMPDIR / ("backup_old_" + OUT.name))
+
+OUT.write_text(html, encoding="utf-8")
+
+# 运行日志（主键 infoid）与全局台账
+stamp = config.now_stamp()
+log_rows, log_pending = logstore.write_log(DAY, items, stamp)
+log_index = logstore.update_index(items, DAY, stamp)
+
+# ------------------------------------------------------------------ 6. 自检（无人值守运行时的健康检查）
+problems = []
+
+
+def check(label, ok, detail=""):
+    print("%-16s: %s%s" % (label, "OK" if ok else "FAIL", (" | " + detail) if detail else ""))
+    if not ok:
+        problems.append(label)
+
+
+out = OUT.read_text(encoding="utf-8")
+static = out.split("<script>")[0]
+raw_block = out.split("const RAW_DATA = [")[1].split("\n];")[0]
+raw_rows = json.loads("[" + raw_block.strip().rstrip(",") + "]")
+
+check("设计基准未变", hashlib.md5(PREVIEW.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == PREVIEW_MD5)
+check("数据条数", len(raw_rows) == total_n, "RAW_DATA=%d 期望=%d" % (len(raw_rows), total_n))
+check("唯一识别码", len({r["infoid"] for r in raw_rows}) == total_n, "infoid 唯一")
+check("官方链接", all(("projectDetails.html?infoid=" in r["link"] or "cz.gxygcg.com" in r["link"]) for r in raw_rows))
+check("无自造编号", ("code-tag" not in out) and ("data-code" not in out) and ("GX%s" % DAY_KEY) not in out)
+check("指标卡", static.count('class="sb-label"') == 8, json.dumps(stat_map, ensure_ascii=False))
+check("筛选控件", static.count('class="select-input"') == 4 and "仅看重点项目" in static and "仅看重点业主" in static and "仅看加班发布" in static and "重置" in static)
+check("静态 div 配平", static.count("<div") == static.count("</div>"))
+check("外部依赖", not any(k in out.lower() for k in ("tailwind", "all.min.css", "saved_resource", "file://")))
+check("运行日志", log_rows == total_n, "%s 行=%d 待重取=%d" % (LOG, log_rows, len(log_pending)))
+check("全局台账", all(it["infoid"] in log_index for it in items), "index.json 共 %d 条" % len(log_index))
+print("产物            :", OUT)
+if problems:
+    print("自检未通过      :", "、".join(problems))
+    raise SystemExit(1)
+print("自检通过")
+
+# ------------------------------------------------------------------ 联动更新归档首页
+print("正在同步更新首页/归档索引...")
+try:
+    import run_daily
+    run_daily.refresh_archive(DAY)
+    try:
+        import run_archive
+        rc = run_archive.main() if hasattr(run_archive, 'main') else 0
+    except ImportError:
+        archive_script = _REPO / "scripts" / "build_archive_page.py"
+        if getattr(sys, 'frozen', False):
+            import runpy
+            runpy.run_path(str(archive_script), run_name="__main__")
+            rc = 0
+        else:
+            rc = subprocess.run([sys.executable, str(archive_script)]).returncode
+    if rc == 0:
+        print("归档首页同步完成")
+    else:
+        print("WARN: 归档首页生成返回异常码 %d" % rc)
+
+    # 联动同步 VPS
+    if getattr(config, "AUTO_UPLOAD_VPS", True) and not getattr(ARGS, "no_vps", False):
+        upload_script = _REPO / "scripts" / "upload_vps.py"
+        if upload_script.exists():
+            subprocess.run([sys.executable, str(upload_script)], check=False)
+except Exception as exc:
+    print("WARN: 同步归档首页失败: %s" % exc)
